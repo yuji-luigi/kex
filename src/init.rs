@@ -24,7 +24,7 @@ pub fn run(o: Opts) -> Result<u8> {
 
     if let Some(path) = config::config_path(&root)? {
         if !o.reset {
-            println!(
+            say!(
                 "already a kex repo: {} (use --reset to give it new ids)",
                 util::tilde(&path)
             );
@@ -34,15 +34,13 @@ pub fn run(o: Opts) -> Result<u8> {
         let mut c = config::load(&path)?;
         let name = match o.repo {
             Some(n) => n,
-            None if ask => inquire::Text::new("New repo name:")
-                .with_default(&format!("{}-2", c.repo))
-                .prompt()?,
+            None if ask => crate::ui::text("New repo name:", Some(&format!("{}-2", c.repo)))?,
             None => bail!("pass --repo <name> with --reset"),
         };
         c.repo_id = config::new_repo_id();
         c.repo = name;
         config::save(&path, &c)?;
-        println!(
+        say!(
             "new repo_id {} and name \"{}\" written to {}. Review and commit it.",
             c.repo_id,
             c.repo,
@@ -76,32 +74,27 @@ pub fn run(o: Opts) -> Result<u8> {
     let project = match o.project {
         Some(p) => p,
         None if ask => {
-            let mut labels: Vec<String> = nearby
+            let mut opts: Vec<crate::ui::Opt> = nearby
                 .iter()
                 .map(|(id, rs)| {
-                    format!(
-                        "Join {id} ({})",
-                        rs.iter()
-                            .map(|r| r.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
+                    let names: Vec<&str> = rs.iter().map(|r| r.name.as_str()).collect();
+                    crate::ui::Opt::new(id, format!("Join {id} ({})", names.join(", ")))
+                        .data(serde_json::json!({ "repos": names }))
                 })
                 .collect();
-            labels.push("Create a new project".into());
-            let i = if labels.len() == 1 {
+            opts.push(crate::ui::Opt::new("new", "Create a new project"));
+            let i = if opts.len() == 1 {
                 0
             } else {
-                inquire::Select::new("Project", labels).raw_prompt()?.index
+                crate::ui::select_one("Project", &opts)?
             };
             if i < ids.len() {
                 ids[i].clone()
             } else {
-                new_project(
-                    &inquire::Text::new("New project name:")
-                        .with_default(&util::slug(&default_name))
-                        .prompt()?,
-                )
+                new_project(&crate::ui::text(
+                    "New project name:",
+                    Some(&util::slug(&default_name)),
+                )?)
             }
         }
         None if ids.len() == 1 => ids[0].clone(),
@@ -114,9 +107,10 @@ pub fn run(o: Opts) -> Result<u8> {
         .unwrap_or_default();
     let repo = match o.repo {
         Some(r) => r,
-        None if ask => inquire::Text::new("Repo name (short, used in flags like --repos):")
-            .with_default(&util::slug(&folder))
-            .prompt()?,
+        None if ask => crate::ui::text(
+            "Repo name (short, used in flags like --repos):",
+            Some(&util::slug(&folder)),
+        )?,
         None => util::slug(&folder),
     };
     let members = nearby.get(&project).map(Vec::as_slice).unwrap_or_default();
@@ -167,13 +161,13 @@ pub fn run(o: Opts) -> Result<u8> {
     );
     reg.save()?;
 
-    println!("wrote {}", util::tilde(&path));
-    println!("  project  {project}");
-    println!("  repo     {repo} ({})", config.repo_id);
+    say!("wrote {}", util::tilde(&path));
+    say!("  project  {project}");
+    say!("  repo     {repo} ({})", config.repo_id);
     for b in &config.prime_branches {
-        println!("  prime    {} ({:?})", b.branch, b.stage);
+        say!("  prime    {} ({:?})", b.branch, b.stage);
     }
-    println!(
+    say!(
         "Check the prime branches, then commit the file. Run kex init in the other repos to join {project}."
     );
     Ok(0)

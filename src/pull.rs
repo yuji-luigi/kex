@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 
 use crate::project::{self, Repo};
-use crate::{gh, git, util};
+use crate::{gh, git, ui, util};
 
 pub struct Update {
     pub branch: String,
@@ -97,11 +97,41 @@ fn merged_heads(r: &Repo) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-/// Branches on the shared remote not merged into any prime branch, one line each.
-pub fn unmerged(r: &Repo, all: bool, merged: &HashSet<String>) -> Vec<String> {
+pub struct Branch {
+    pub name: String,
+    pub prime: String,
+    pub ahead: u32,
+    pub behind: u32,
+    pub author: String,
+    pub date: String,
+}
+
+impl Branch {
+    fn line(&self) -> String {
+        format!(
+            "{:<26} → {:<8} +{} / -{}  {}  {}",
+            self.name,
+            self.prime,
+            self.ahead,
+            self.behind,
+            self.author,
+            util::dim(&self.date)
+        )
+    }
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "branch": self.name, "prime": self.prime, "ahead": self.ahead,
+            "behind": self.behind, "author": self.author, "date": self.date,
+        })
+    }
+}
+
+/// Branches on the shared remote not merged into any prime branch. `Err` = why there is no
+/// list (no remote, no prime branch).
+pub fn unmerged(r: &Repo, all: bool, merged: &HashSet<String>) -> Result<Vec<Branch>, String> {
     let dir = &r.path;
     let Some(remote) = git::shared_remote(dir) else {
-        return vec![util::dim("no remote")];
+        return Err("no remote".into());
     };
     let primes: Vec<&str> = r
         .config
@@ -121,14 +151,14 @@ pub fn unmerged(r: &Repo, all: bool, merged: &HashSet<String>) -> Vec<String> {
         })
         .collect();
     if primes.is_empty() {
-        return vec![util::dim(format!("no prime branch found on {remote}"))];
+        return Err(format!("no prime branch found on {remote}"));
     }
     let format = "--format=%(refname:short)%09%(authorname)%09%(committerdate:unix)%09%(committerdate:format:%Y-%m-%d %H:%M)";
     let Ok(refs) = git::git(
         dir,
         &["for-each-ref", &format!("refs/remotes/{remote}"), format],
     ) else {
-        return vec![];
+        return Ok(vec![]);
     };
     let cutoff = util::now().saturating_sub(30 * 86_400);
     let prefix = format!("{remote}/");
@@ -171,12 +201,16 @@ pub fn unmerged(r: &Repo, all: bool, merged: &HashSet<String>) -> Vec<String> {
             })
             .min_by_key(|x| x.2)
             .unwrap_or((primes[0], 0, 0));
-        out.push(format!(
-            "{branch:<26} → {prime:<8} +{ahead} / -{behind}  {author}  {}",
-            util::dim(date)
-        ));
+        out.push(Branch {
+            name: branch.to_string(),
+            prime: prime.to_string(),
+            ahead,
+            behind,
+            author: author.to_string(),
+            date: date.to_string(),
+        });
     }
-    out
+    Ok(out)
 }
 
 pub fn run(all: bool, to_prime: bool) -> Result<u8> {
@@ -192,35 +226,50 @@ pub fn run(all: bool, to_prime: bool) -> Result<u8> {
         .collect();
     let results = util::parallel(&jobs, |(r, report)| {
         let u = update(r, to_prime);
-        let lines = if *report {
+        let found = report.then(|| {
             let merged = if gh_ready {
                 merged_heads(r)
             } else {
                 HashSet::new()
             };
             unmerged(r, all, &merged)
-        } else {
-            Vec::new()
-        };
-        (u, lines)
+        });
+        (u, found)
     });
     let mut code = 0;
-    for ((r, _), (u, lines)) in jobs.iter().zip(results) {
+    for ((r, _), (u, found)) in jobs.iter().zip(results) {
+        ui::event(
+            "pull",
+            serde_json::json!({
+                "repo": r.name, "path": r.path, "branch": u.branch, "ok": u.ok,
+                "status": ui::strip_ansi(&u.status),
+                "unmerged": match &found {
+                    Some(Ok(bs)) => serde_json::json!(bs.iter().map(Branch::json).collect::<Vec<_>>()),
+                    _ => serde_json::Value::Null,
+                },
+                "unmerged_note": match &found { Some(Err(n)) => Some(n.as_str()), _ => None },
+            }),
+        );
+        let lines: Vec<String> = match &found {
+            Some(Ok(bs)) => bs.iter().map(Branch::line).collect(),
+            Some(Err(note)) => vec![util::dim(note)],
+            None => vec![],
+        };
         let path = if p.checkouts(&r.name).len() > 1 {
             format!(" {}", util::dim(util::tilde(&r.path)))
         } else {
             String::new()
         };
-        println!(
+        say!(
             "{} ({}){path} {}",
             util::bold(format!("== {}", r.name)),
             u.branch,
             u.status
         );
         if !lines.is_empty() {
-            println!("   unmerged:");
+            say!("   unmerged:");
             for l in lines {
-                println!("   {l}");
+                say!("   {l}");
             }
         }
         if !u.ok {
@@ -228,7 +277,7 @@ pub fn run(all: bool, to_prime: bool) -> Result<u8> {
         }
     }
     if !gh_ready {
-        println!(
+        say!(
             "{}",
             util::dim("(gh not available: branches merged by squash may still be listed)")
         );
@@ -236,7 +285,7 @@ pub fn run(all: bool, to_prime: bool) -> Result<u8> {
     Ok(code)
 }
 
-pub fn status(json: bool) -> Result<u8> {
+pub fn status() -> Result<u8> {
     let p = project::resolve(&std::env::current_dir()?)?;
     let repos: Vec<&Repo> = p.repos.iter().collect();
     let rows = util::parallel(&repos, |r| {
@@ -254,7 +303,7 @@ pub fn status(json: bool) -> Result<u8> {
             git::changed_files(&r.path),
         )
     });
-    if json {
+    if ui::json() {
         let list: Vec<serde_json::Value> = repos
             .iter()
             .zip(&rows)
@@ -266,11 +315,9 @@ pub fn status(json: bool) -> Result<u8> {
             })
             .collect();
         let missing: Vec<&str> = p.missing.iter().map(|m| m.repo.as_str()).collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(
-                &serde_json::json!({ "project": p.id, "repos": list, "missing": missing })
-            )?
+        ui::emit(
+            "status",
+            serde_json::json!({ "project": p.id, "repos": list, "missing": missing }),
         );
         return Ok(0);
     }
@@ -291,7 +338,7 @@ pub fn status(json: bool) -> Result<u8> {
         } else {
             util::green("clean")
         });
-        println!(
+        say!(
             "  {:<8} {:<24} {}  {}",
             r.name,
             branch,

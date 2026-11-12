@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use crate::project::{self, Repo};
-use crate::{gh, util};
+use crate::{gh, ui, util};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,7 +50,7 @@ fn fetch<'a>(repos: &[&'a Repo]) -> Vec<Row<'a>> {
                 repo: r,
                 pr,
             })),
-            Err(e) => eprintln!(
+            Err(e) => warn!(
                 "{} {}: {}",
                 util::yellow("⚠"),
                 r.name,
@@ -83,10 +83,19 @@ fn label(row: &Row) -> String {
     )
 }
 
+fn data(row: &Row) -> serde_json::Value {
+    serde_json::json!({
+        "repo": row.repo.name, "number": row.pr.number, "title": row.pr.title,
+        "head": row.pr.head_ref_name, "base": row.pr.base_ref_name,
+        "author": row.pr.author.login, "created_at": row.pr.created_at,
+        "draft": row.pr.is_draft, "production": row.production,
+    })
+}
+
 pub fn run(list_only: bool) -> Result<u8> {
     let st = gh::state();
     if st != gh::State::Ready {
-        eprintln!("kex: pr check {}", gh::help(st));
+        warn!("kex: pr check {}", gh::help(st));
         return Ok(3);
     }
     let p = project::resolve(&std::env::current_dir()?)?;
@@ -98,7 +107,7 @@ pub fn run(list_only: bool) -> Result<u8> {
         if gh::provider(r) == gh::Provider::GitHub {
             repos.push(r);
         } else {
-            println!(
+            say!(
                 "  {} {:<8} {}",
                 util::dim("-"),
                 r.name,
@@ -109,27 +118,33 @@ pub fn run(list_only: bool) -> Result<u8> {
     loop {
         let rows = fetch(&repos);
         if rows.is_empty() {
-            println!("no open PRs");
+            say!("no open PRs");
             return Ok(0);
         }
+        ui::event(
+            "prs",
+            serde_json::json!({ "items": rows.iter().map(data).collect::<Vec<_>>() }),
+        );
         if list_only || !util::interactive() {
             for r in &rows {
-                println!("{}", label(r));
+                say!("{}", label(r));
             }
             return Ok(0);
         }
-        let mut labels: Vec<String> = rows.iter().map(label).collect();
-        labels.push("Quit".into());
-        let Some(choice) = inquire::Select::new("Open PRs", labels)
-            .with_page_size(15)
-            .raw_prompt_skippable()?
-        else {
+        let mut opts: Vec<ui::Opt> = rows
+            .iter()
+            .map(|r| {
+                ui::Opt::new(format!("{}#{}", r.repo.name, r.pr.number), label(r)).data(data(r))
+            })
+            .collect();
+        opts.push(ui::Opt::new("quit", "Quit"));
+        let Some(choice) = ui::select("Open PRs", &opts, Some(15))? else {
             return Ok(0);
         };
-        if choice.index == rows.len() {
+        if choice == rows.len() {
             return Ok(0);
         }
-        review(&rows[choice.index])?;
+        review(&rows[choice])?;
     }
 }
 
@@ -138,21 +153,21 @@ fn review(row: &Row) -> Result<()> {
     let n = row.pr.number.to_string();
     let rule = |c: char| c.to_string().repeat(64);
     loop {
-        println!("{}", rule('='));
+        say!("{}", rule('='));
         gh::gh_inherit(dir, &["pr", "view", &n], true)?;
-        println!("{}\nFiles changed:", rule('-'));
+        say!("{}\nFiles changed:", rule('-'));
         let files = r#".files[] | "  +\(.additions) -\(.deletions)  \(.path)""#;
         if let Ok(f) = gh::gh(dir, &["pr", "view", &n, "--json", "files", "--jq", files]) {
-            println!("{f}");
+            say!("{f}");
         }
-        println!("Checks:");
+        say!("Checks:");
         match gh::gh(dir, &["pr", "checks", &n]) {
-            Ok(c) if !c.is_empty() => c.lines().for_each(|l| println!("  {l}")),
-            _ => println!("  (none)"),
+            Ok(c) if !c.is_empty() => c.lines().for_each(|l| say!("  {l}")),
+            _ => say!("  (none)"),
         }
-        println!("{}", rule('='));
+        say!("{}", rule('='));
         if row.production {
-            println!(
+            say!(
                 "{}",
                 util::red(format!(
                     "!! This PR merges into {} (PRODUCTION)",
@@ -161,22 +176,24 @@ fn review(row: &Row) -> Result<()> {
             );
         }
         let title = format!("#{} {}", row.pr.number, row.pr.title);
-        match inquire::Select::new(&title, vec!["Merge", "Show diff", "Back"]).prompt_skippable()? {
-            Some("Show diff") => {
+        let actions = [
+            ui::Opt::new("merge", "Merge"),
+            ui::Opt::new("diff", "Show diff"),
+            ui::Opt::new("back", "Back"),
+        ];
+        match ui::select(&title, &actions, None)? {
+            Some(1) => {
                 gh::gh_inherit(dir, &["pr", "diff", &n], false)?;
                 continue;
             }
-            Some("Merge") => {}
+            Some(0) => {}
             _ => return Ok(()),
         }
         let question = format!(
             "Merge #{} \"{}\" ({}) into {}?",
             row.pr.number, row.pr.title, row.repo.name, row.pr.base_ref_name
         );
-        if !inquire::Confirm::new(&question)
-            .with_default(false)
-            .prompt()?
-        {
+        if !ui::confirm(&question, false)? {
             return Ok(());
         }
         let word = if row.production {
@@ -184,9 +201,9 @@ fn review(row: &Row) -> Result<()> {
         } else {
             "accept".into()
         };
-        let typed = inquire::Text::new(&format!("Type `{word}` to merge:")).prompt()?;
+        let typed = ui::text(&format!("Type `{word}` to merge:"), None)?;
         if typed.trim() != word {
-            println!("cancelled");
+            say!("cancelled");
             return Ok(());
         }
         if gh::gh_inherit(dir, &["pr", "merge", &n, "--merge"], true)? {
@@ -195,18 +212,22 @@ fn review(row: &Row) -> Result<()> {
                 &["pr", "view", &n, "--json", "state", "--jq", ".state"],
             )
             .unwrap_or_default();
+            ui::event(
+                "merged",
+                serde_json::json!({ "repo": row.repo.name, "number": row.pr.number, "state": state }),
+            );
             if state == "MERGED" {
-                println!(
+                say!(
                     "{}",
                     util::green(format!("✓ #{n} merged into {}", row.pr.base_ref_name))
                 );
             } else {
-                println!(
+                say!(
                     "#{n} merge requested, but it is still {state} (merge queue / pending checks?)"
                 );
             }
         } else {
-            println!("{}", util::red(format!("✗ merge of #{n} failed")));
+            say!("{}", util::red(format!("✗ merge of #{n} failed")));
         }
         return Ok(());
     }

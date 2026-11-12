@@ -76,8 +76,25 @@ pub fn gh(dir: &Path, args: &[&str]) -> Result<String> {
 pub fn gh_inherit(dir: &Path, args: &[&str], no_pager: bool) -> Result<bool> {
     let mut c = Command::new("gh");
     c.args(args).current_dir(dir);
-    if no_pager {
+    if no_pager || crate::ui::json() {
         c.env("GH_PAGER", "cat");
+    }
+    if crate::ui::json() {
+        // Keep stdout for events: capture, then send the text as log lines.
+        let out = c
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("failed to run gh")?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !text.trim().is_empty() {
+            crate::ui::say(text.trim_end());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.trim().is_empty() {
+            crate::ui::warn(err.trim_end());
+        }
+        return Ok(out.status.success());
     }
     Ok(c.status().context("failed to run gh")?.success())
 }

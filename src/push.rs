@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::{Result, bail};
 
 use crate::project::{self, Repo};
-use crate::{git, util};
+use crate::{git, ui, util};
 
 struct Item<'a> {
     repo: &'a Repo,
@@ -62,20 +62,30 @@ pub fn run(names: Option<Vec<String>>, yes: bool) -> Result<u8> {
             v
         }
         None if util::interactive() => {
-            let labels: Vec<String> = items.iter().map(describe).collect();
+            let opts: Vec<ui::Opt> = items
+                .iter()
+                .map(|it| {
+                    ui::Opt::new(&it.repo.name, describe(it)).data(serde_json::json!({
+                        "branch": it.branch, "ahead": it.ahead,
+                        "upstream": it.upstream, "dirty": it.dirty,
+                    }))
+                })
+                .collect();
             let preselected: Vec<usize> =
                 (0..items.len()).filter(|i| items[*i].ahead > 0).collect();
-            inquire::MultiSelect::new("Push the current branch of which repos?", labels)
-                .with_default(&preselected)
-                .raw_prompt()?
-                .into_iter()
-                .map(|c| &items[c.index])
-                .collect()
+            ui::multi_select(
+                "Push the current branch of which repos?",
+                &opts,
+                &preselected,
+            )?
+            .into_iter()
+            .map(|i| &items[i])
+            .collect()
         }
         None => bail!("no terminal to ask in: pass --repos a,b (and --yes)"),
     };
     if chosen.is_empty() {
-        println!("nothing selected");
+        say!("nothing selected");
         return Ok(0);
     }
     if names.is_some() && !yes {
@@ -83,12 +93,9 @@ pub fn run(names: Option<Vec<String>>, yes: bool) -> Result<u8> {
             bail!("pass --yes to push without a terminal");
         }
         for it in &chosen {
-            println!("  {}", describe(it));
+            say!("  {}", describe(it));
         }
-        if !inquire::Confirm::new("Push these?")
-            .with_default(true)
-            .prompt()?
-        {
+        if !ui::confirm("Push these?", true)? {
             return Ok(0);
         }
     }
@@ -97,17 +104,17 @@ pub fn run(names: Option<Vec<String>>, yes: bool) -> Result<u8> {
     for it in chosen {
         let name = &it.repo.name;
         if it.branch == "(detached)" {
-            println!("{} {name}: detached HEAD, skipped", util::yellow("⚠"));
+            say!("{} {name}: detached HEAD, skipped", util::yellow("⚠"));
             continue;
         }
         if it.ahead == 0 && it.upstream {
-            println!("{} {name}: nothing to push", util::dim("-"));
+            say!("{} {name}: nothing to push", util::dim("-"));
             continue;
         }
         if it.repo.is_protected(&it.branch) {
             // Typed confirmation, never skipped by --yes (§7).
             if !util::interactive() {
-                println!(
+                say!(
                     "{} {name}: {} is protected; run interactively to confirm",
                     util::red("✗"),
                     it.branch
@@ -115,17 +122,19 @@ pub fn run(names: Option<Vec<String>>, yes: bool) -> Result<u8> {
                 code = 1;
                 continue;
             }
-            let typed = inquire::Text::new(&format!(
-                "{name}: {} is protected. Type `{}` to push:",
-                it.branch, it.branch
-            ))
-            .prompt()?;
+            let typed = ui::text(
+                &format!(
+                    "{name}: {} is protected. Type `{}` to push:",
+                    it.branch, it.branch
+                ),
+                None,
+            )?;
             if typed.trim() != it.branch {
-                println!("{name}: skipped");
+                say!("{name}: skipped");
                 continue;
             }
         }
-        println!(
+        say!(
             "{} {name}: git push -u origin {}",
             util::bold("==>"),
             it.branch
@@ -133,10 +142,15 @@ pub fn run(names: Option<Vec<String>>, yes: bool) -> Result<u8> {
         let ok = Command::new("git")
             .args(["push", "-u", "origin", &it.branch])
             .current_dir(&it.repo.path)
+            .stdout(ui::child_stdout())
             .status()
             .is_ok_and(|s| s.success());
+        ui::event(
+            "pushed",
+            serde_json::json!({ "repo": name, "branch": it.branch, "ok": ok }),
+        );
         if !ok {
-            println!("{} {name}: push failed", util::red("✗"));
+            say!("{} {name}: push failed", util::red("✗"));
             code = 1;
         }
     }

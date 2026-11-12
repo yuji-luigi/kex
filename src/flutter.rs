@@ -82,20 +82,21 @@ pub fn choose(name: Option<&str>) -> Result<Sim> {
     if !util::interactive() {
         return Ok(sims.swap_remove(0));
     }
-    let labels: Vec<String> = sims
+    let opts: Vec<crate::ui::Opt> = sims
         .iter()
         .map(|s| {
-            format!(
+            let label = format!(
                 "{} ({}){}",
                 s.name,
                 s.runtime,
                 if s.booted { " · booted" } else { "" }
-            )
+            );
+            crate::ui::Opt::new(&s.udid, label).data(serde_json::json!({
+                "name": s.name, "runtime": s.runtime, "booted": s.booted,
+            }))
         })
         .collect();
-    let i = inquire::Select::new("iOS simulator", labels)
-        .raw_prompt()?
-        .index;
+    let i = crate::ui::select_one("iOS simulator", &opts)?;
     Ok(sims.swap_remove(i))
 }
 
@@ -117,7 +118,7 @@ pub fn boot(s: &Sim) {
         &["-a", "Simulator", "--args", "-CurrentDeviceUDID", &s.udid],
     ) || quiet("open", &["-a", "DeviceHub"]);
     if !opened {
-        eprintln!(
+        warn!(
             "kex: simulator window app not found; {} is booted headless",
             s.name
         );

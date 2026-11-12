@@ -1,12 +1,14 @@
 //! `kex run`: detect how to run each repo, start them together, stop them together
 //! (BLUEPRINT §5.3).
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::ChildStdin;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -14,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use crate::config;
 use crate::project::{self, Repo};
 use crate::registry::{GlobalConfig, Registry};
-use crate::{flutter, pull, util};
+use crate::{flutter, pull, ui, util};
 
 pub struct Opts {
     pub repos: Option<Vec<String>>,
@@ -188,7 +190,7 @@ pub fn run(o: Opts) -> Result<u8> {
         plans.push(plan_for(p.pick(&name)?));
     }
     for pl in plans.iter().filter(|x| x.unavailable.is_some()) {
-        println!(
+        say!(
             "  {} {:<8} {}",
             util::dim("-"),
             pl.repo.name,
@@ -216,24 +218,26 @@ pub fn run(o: Opts) -> Result<u8> {
         }
         v
     } else if util::interactive() && avail.len() > 1 {
-        let labels: Vec<String> = avail
+        let opts: Vec<ui::Opt> = avail
             .iter()
             .map(|i| {
                 let x = &plans[*i];
-                format!("{:<8} {:<28} ({})", x.repo.name, x.label, x.reason)
+                let label = format!("{:<8} {:<28} ({})", x.repo.name, x.label, x.reason);
+                ui::Opt::new(&x.repo.name, label).data(serde_json::json!({
+                    "runtime": x.label, "reason": x.reason, "port": x.port,
+                    "path": x.repo.path,
+                }))
             })
             .collect();
-        let all: Vec<usize> = (0..labels.len()).collect();
-        inquire::MultiSelect::new("Run which repos?", labels)
-            .with_default(&all)
-            .raw_prompt()?
+        let all: Vec<usize> = (0..opts.len()).collect();
+        ui::multi_select("Run which repos?", &opts, &all)?
             .into_iter()
-            .map(|c| avail[c.index])
+            .map(|c| avail[c])
             .collect()
     } else {
         for i in &avail {
             let x = &plans[*i];
-            println!(
+            say!(
                 "  {} {:<8} {} ({})",
                 util::green("✓"),
                 x.repo.name,
@@ -244,7 +248,7 @@ pub fn run(o: Opts) -> Result<u8> {
         avail.clone()
     };
     if chosen.is_empty() {
-        println!("nothing to run");
+        say!("nothing to run");
         return Ok(0);
     }
     let chosen: Vec<&Plan> = chosen.iter().map(|i| &plans[*i]).collect();
@@ -258,7 +262,7 @@ pub fn run(o: Opts) -> Result<u8> {
         if let Some(port) = pl.port.filter(|port| port_in_use(*port))
             && !o.force
         {
-            println!(
+            say!(
                 "{} {}: port {port} is already in use (maybe a worktree runs it?), skipped. Use --force to run anyway.",
                 util::yellow("⚠"),
                 pl.repo.name
@@ -297,7 +301,14 @@ pub fn run(o: Opts) -> Result<u8> {
 fn update_and_install(plans: &[&Plan], force: bool) -> Result<()> {
     let updates = util::parallel(plans, |pl| pull::update(pl.repo, false));
     for (pl, u) in plans.iter().zip(&updates) {
-        println!(
+        ui::event(
+            "pull",
+            serde_json::json!({
+                "repo": pl.repo.name, "path": pl.repo.path, "branch": u.branch,
+                "ok": u.ok, "status": ui::strip_ansi(&u.status),
+            }),
+        );
+        say!(
             "{} ({}) {}",
             util::bold(format!("== {}", pl.repo.name)),
             u.branch,
@@ -322,9 +333,10 @@ fn update_and_install(plans: &[&Plan], force: bool) -> Result<()> {
         if up_to_date && !force {
             continue;
         }
-        println!("{} {}: {cmd}", util::bold("==>"), pl.repo.name);
+        say!("{} {}: {cmd}", util::bold("==>"), pl.repo.name);
         let st = shell(cmd)
             .current_dir(&pl.repo.path)
+            .stdout(ui::child_stdout())
             .status()
             .with_context(|| format!("running {cmd}"))?;
         if !st.success() {
@@ -359,7 +371,14 @@ fn supervise(services: Vec<Service>) -> Result<u8> {
         let _ = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst));
     }
     let width = services.iter().map(|s| s.name.len()).max().unwrap_or(0);
-    let mut children: Vec<(String, Child)> = Vec::new();
+    let json = ui::json();
+    // JSON mode: stdin carries `input` / `stop` messages, forwarded to the services.
+    let inputs: Arc<Mutex<HashMap<String, ChildStdin>>> = Arc::default();
+    let default_input = services
+        .iter()
+        .find(|s| s.pidfile.is_some())
+        .map(|s| s.name.clone());
+    let mut children: Vec<(String, String, Child)> = Vec::new();
     let mut watchers = Vec::new();
     let mut stdin_taken = false;
     for (i, s) in services.into_iter().enumerate() {
@@ -367,61 +386,76 @@ fn supervise(services: Vec<Service>) -> Result<u8> {
         let mut c = shell(&s.cmd);
         c.current_dir(&s.dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("FORCE_COLOR", "1");
+            .stderr(Stdio::piped());
+        if !json {
+            c.env("FORCE_COLOR", "1");
+        }
         // flutter reads r / R / q from the keyboard; only one service can own it.
-        if s.pidfile.is_some() && !stdin_taken {
+        if json {
+            c.stdin(Stdio::piped());
+        } else if s.pidfile.is_some() && !stdin_taken {
             c.stdin(Stdio::inherit());
             stdin_taken = true;
         } else {
             c.stdin(Stdio::null());
         }
-        println!("{prefix} {}", util::dim(format!("$ {}", s.cmd)));
+        say!("{prefix} {}", util::dim(format!("$ {}", s.cmd)));
         let mut child = match c.spawn() {
             Ok(ch) => ch,
             Err(e) => {
-                println!("{prefix} {}", util::red(format!("failed to start: {e}")));
+                say!("{prefix} {}", util::red(format!("failed to start: {e}")));
                 continue;
             }
         };
-        let streams: [Option<Box<dyn Read + Send>>; 2] = [
+        ui::event(
+            "started",
+            serde_json::json!({ "repo": s.name, "cmd": s.cmd, "pid": child.id(), "path": s.dir }),
+        );
+        if let Some(stdin) = child.stdin.take() {
+            inputs.lock().unwrap().insert(s.name.clone(), stdin);
+        }
+        let streams: [Option<(&'static str, Box<dyn Read + Send>)>; 2] = [
             child
                 .stdout
                 .take()
-                .map(|s| Box::new(s) as Box<dyn Read + Send>),
+                .map(|s| ("stdout", Box::new(s) as Box<dyn Read + Send>)),
             child
                 .stderr
                 .take()
-                .map(|s| Box::new(s) as Box<dyn Read + Send>),
+                .map(|s| ("stderr", Box::new(s) as Box<dyn Read + Send>)),
         ];
-        for stream in streams.into_iter().flatten() {
-            let prefix = prefix.clone();
-            std::thread::spawn(move || pipe(stream, &prefix));
+        for (kind, stream) in streams.into_iter().flatten() {
+            let (prefix, name) = (prefix.clone(), s.name.clone());
+            std::thread::spawn(move || pipe(stream, &prefix, &name, kind));
         }
         if let Some(url) = s.ready.clone() {
-            let (prefix, stop) = (prefix.clone(), stop.clone());
-            std::thread::spawn(move || wait_ready(&url, &prefix, &stop));
+            let (prefix, stop, name) = (prefix.clone(), stop.clone(), s.name.clone());
+            std::thread::spawn(move || wait_ready(&url, &prefix, &name, &stop));
         }
         if let Some(pf) = &s.pidfile {
             match flutter::watch(&s.dir.join("lib"), pf) {
                 Some(w) => {
-                    println!(
+                    say!(
                         "{prefix} {}",
                         util::dim("hot reload on save: watching lib/ (r / R / q also work)")
                     );
                     watchers.push(w);
                 }
-                None => println!("{prefix} {}", util::dim("press r to hot reload")),
+                None => say!("{prefix} {}", util::dim("press r to hot reload")),
             }
         }
-        children.push((prefix, child));
+        children.push((prefix, s.name.clone(), child));
+    }
+    if json {
+        let (inputs, stop) = (inputs.clone(), stop.clone());
+        std::thread::spawn(move || read_commands(&inputs, default_input.as_deref(), &stop));
     }
 
     let mut done = vec![false; children.len()];
     let mut stop_at: Option<Instant> = None;
     let mut code = 0;
     loop {
-        for (i, (prefix, ch)) in children.iter_mut().enumerate() {
+        for (i, (prefix, name, ch)) in children.iter_mut().enumerate() {
             if !done[i]
                 && let Ok(Some(st)) = ch.try_wait()
             {
@@ -429,16 +463,29 @@ fn supervise(services: Vec<Service>) -> Result<u8> {
                 if !st.success() && !stop.load(Ordering::SeqCst) {
                     code = 1;
                 }
-                println!("{prefix} {}", util::dim(format!("exited ({st})")));
+                ui::event(
+                    "exited",
+                    serde_json::json!({ "repo": name, "code": st.code(), "success": st.success() }),
+                );
+                say!("{prefix} {}", util::dim(format!("exited ({st})")));
             }
         }
         if done.iter().all(|d| *d) {
             break;
         }
         if stop.load(Ordering::SeqCst) {
+            if stop_at.is_none() && json {
+                // No shared terminal sent Ctrl-C: interrupt the services ourselves.
+                inputs.lock().unwrap().clear();
+                for (i, (_, _, ch)) in children.iter_mut().enumerate() {
+                    if !done[i] {
+                        interrupt(ch);
+                    }
+                }
+            }
             let since = *stop_at.get_or_insert_with(Instant::now);
             if since.elapsed() > Duration::from_secs(5) {
-                for (i, (_, ch)) in children.iter_mut().enumerate() {
+                for (i, (_, _, ch)) in children.iter_mut().enumerate() {
                     if !done[i] {
                         kill_tree(ch);
                     }
@@ -451,7 +498,71 @@ fn supervise(services: Vec<Service>) -> Result<u8> {
     Ok(code)
 }
 
-fn pipe(stream: Box<dyn Read + Send>, prefix: &str) {
+/// JSON mode: `{"type":"input","repo":"app","text":"r"}` types into a service (default: the
+/// flutter one), `{"type":"stop"}` stops everything.
+fn read_commands(
+    inputs: &Mutex<HashMap<String, ChildStdin>>,
+    default: Option<&str>,
+    stop: &AtomicBool,
+) {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+            return; // closed: keep running, Ctrl-C / SIGTERM still work
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            ui::emit(
+                "error",
+                serde_json::json!({ "message": "expected a JSON object" }),
+            );
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("stop") => {
+                stop.store(true, Ordering::SeqCst);
+                return;
+            }
+            Some("input") => {
+                let Some(repo) = v["repo"].as_str().or(default) else {
+                    ui::emit(
+                        "error",
+                        serde_json::json!({ "message": "input needs \"repo\"" }),
+                    );
+                    continue;
+                };
+                let text = v["text"].as_str().unwrap_or("");
+                let mut map = inputs.lock().unwrap();
+                match map.get_mut(repo) {
+                    Some(w) => {
+                        let _ = w.write_all(text.as_bytes()).and_then(|_| w.flush());
+                    }
+                    None => ui::emit(
+                        "error",
+                        serde_json::json!({ "message": format!("no running service \"{repo}\"") }),
+                    ),
+                }
+            }
+            _ => ui::emit(
+                "error",
+                serde_json::json!({ "message": "unknown message; expected type input or stop" }),
+            ),
+        }
+    }
+}
+
+fn interrupt(ch: &mut Child) {
+    #[cfg(unix)]
+    // SAFETY: plain kill(2) on our own child's pid.
+    unsafe {
+        libc::kill(ch.id() as libc::pid_t, libc::SIGINT);
+    }
+    #[cfg(windows)]
+    kill_tree(ch);
+}
+
+fn pipe(stream: Box<dyn Read + Send>, prefix: &str, name: &str, kind: &str) {
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
     loop {
@@ -460,6 +571,14 @@ fn pipe(stream: Box<dyn Read + Send>, prefix: &str) {
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 let line = String::from_utf8_lossy(&buf);
+                if ui::json() {
+                    let text = ui::strip_ansi(line.trim_end_matches(['\n', '\r']));
+                    ui::emit(
+                        "output",
+                        serde_json::json!({ "repo": name, "stream": kind, "line": text }),
+                    );
+                    continue;
+                }
                 let mut out = std::io::stdout().lock();
                 let _ = writeln!(out, "{prefix} {}", line.trim_end_matches(['\n', '\r']));
             }
@@ -497,12 +616,13 @@ fn reachable(addr: &str, timeout: Duration) -> bool {
         .unwrap_or(false)
 }
 
-fn wait_ready(url: &str, prefix: &str, stop: &AtomicBool) {
+fn wait_ready(url: &str, prefix: &str, name: &str, stop: &AtomicBool) {
     let Some(addr) = host_port(url) else { return };
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(180) && !stop.load(Ordering::SeqCst) {
         if reachable(&addr, Duration::from_millis(300)) {
-            println!("{prefix} {}", util::green(format!("ready: {url}")));
+            ui::event("ready", serde_json::json!({ "repo": name, "url": url }));
+            say!("{prefix} {}", util::green(format!("ready: {url}")));
             return;
         }
         std::thread::sleep(Duration::from_secs(1));

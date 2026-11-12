@@ -1,8 +1,9 @@
 //! End-to-end tests: real git repos in a temp folder, the real `kex` binary.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 struct Env {
     tmp: tempfile::TempDir,
@@ -19,14 +20,19 @@ impl Env {
         self.tmp.path()
     }
 
-    fn kex(&self, dir: &Path, args: &[&str]) -> Output {
+    fn cmd(&self, dir: &Path, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_kex"));
         c.args(args)
             .current_dir(dir)
             .env("KEX_HOME", self.root().join("kexhome"))
+            .env("KEX_NO_UPDATE_CHECK", "1")
             .env("NO_COLOR", "1");
         isolate_git(&mut c);
-        c.output().unwrap()
+        c
+    }
+
+    fn kex(&self, dir: &Path, args: &[&str]) -> Output {
+        self.cmd(dir, args).output().unwrap()
     }
 
     fn kex_ok(&self, dir: &Path, args: &[&str]) -> String {
@@ -91,8 +97,18 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// `--json` prints one event per line; every line must be JSON.
+fn events(text: &str) -> Vec<serde_json::Value> {
+    text.lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+        .collect()
+}
+
 fn status_json(env: &Env, dir: &Path) -> serde_json::Value {
-    serde_json::from_str(&env.kex_ok(dir, &["status", "--json"])).unwrap()
+    events(&env.kex_ok(dir, &["status", "--json"]))
+        .into_iter()
+        .find(|e| e["type"] == "status")
+        .expect("a status event")
 }
 
 fn repo_names(v: &serde_json::Value) -> Vec<String> {
@@ -329,4 +345,65 @@ fn pr_check_without_gh_explains_how_to_install() {
     assert_eq!(out.status.code(), Some(3));
     assert!(stderr(&out).contains("gh auth login"), "{}", stderr(&out));
     assert!(stderr(&out).contains("https://cli.github.com/"));
+}
+
+#[test]
+fn json_mode_streams_events_and_takes_answers_on_stdin() {
+    let env = Env::new();
+    let api = env.repo("p/api");
+    let web = env.repo("p/web");
+    env.kex_ok(&api, &["init", "--yes", "--repo", "api"]);
+    env.kex_ok(&web, &["init", "--yes", "--repo", "web"]);
+    for (dir, word) in [(&api, "hello-api"), (&web, "hello-web")] {
+        let mut c: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("kex.json")).unwrap()).unwrap();
+        c["run"] = serde_json::json!({ "dev": format!("echo {word}") });
+        fs::write(dir.join("kex.json"), c.to_string()).unwrap();
+    }
+
+    // Pull: structured per-repo events, nothing but JSON on stdout.
+    let ev = events(&env.kex_ok(&api, &["pull", "--json"]));
+    assert_eq!(ev[0]["type"], "hello");
+    assert!(ev.iter().any(|e| e["type"] == "project"));
+    assert_eq!(ev.iter().filter(|e| e["type"] == "pull").count(), 2);
+    assert_eq!(ev.last().unwrap()["type"], "exit");
+
+    // Run: the repo question is a prompt; answer it by value.
+    let mut c = env.cmd(&api, &["run", "--json", "--no-update"]);
+    c.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"answer\":[\"web\"]}\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let ev = events(&stdout(&out));
+    let prompt = ev.iter().find(|e| e["type"] == "prompt").expect("prompt");
+    assert_eq!(prompt["kind"], "multiselect");
+    assert_eq!(prompt["options"].as_array().unwrap().len(), 2);
+    let lines: Vec<&serde_json::Value> = ev.iter().filter(|e| e["type"] == "output").collect();
+    assert!(
+        lines
+            .iter()
+            .any(|e| e["repo"] == "web" && e["line"] == "hello-web")
+    );
+    assert!(!lines.iter().any(|e| e["repo"] == "api"));
+    assert!(
+        ev.iter()
+            .any(|e| e["type"] == "exited" && e["repo"] == "web")
+    );
+
+    // Cancelling a prompt exits with 130.
+    let mut c = env.cmd(&api, &["run", "--json", "--no-update"]);
+    c.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"cancel\":true}\n")
+        .unwrap();
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(130));
 }

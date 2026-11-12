@@ -540,7 +540,7 @@ users are affected. They can rename one of the two binaries or use an alias. See
 | Extra | Why |
 |---|---|
 | **Parallel fetch** in `pull`/`status` (one thread per repo) | 3–5 repos fetch in the time of one |
-| **`--json` output** for `status`, `pull`, `pr check --list` | agents and scripts can read results without parsing colors |
+| **`--json` mode** on every command: NDJSON events on stdout, questions as `prompt` events answered on stdin (README "JSON mode") | gateways, agents and scripts can drive kex without parsing terminal text |
 | **`--dry-run`** for `pull` and `push` | shows what would change, safe to try |
 | **Shell completions**: `kex completions zsh\|bash\|fish\|powershell` (`clap_complete`) | tab-completes commands and repo names |
 | **`NO_COLOR` / non-TTY plain output** | correct output in CI, pipes, old terminals |
@@ -609,4 +609,17 @@ Simplified on purpose (can be upgraded later):
 - Port check says the port is busy, but not which process holds it.
 - Registry: atomic write (temp file + rename) without a file lock.
 
-Not built yet: `--dry-run`, `--json` for `pull`, run logs, `kex doctor --prune`, `kex clone`, release pipeline (cargo-dist, Homebrew tap, winget/Scoop; needs the GitHub repo first).
+Added after v0.1:
+
+- `--json` (global): one JSON event per line, every `inquire` question also available as a `prompt` event (`src/ui.rs`); `kex run` takes `input` / `stop` messages on stdin. Protocol version 1.
+- Releases (§8.5).
+
+Not built yet: `--dry-run`, run logs, `kex doctor --prune`, `kex clone`, Homebrew tap, winget/Scoop.
+
+### 8.5 Releases and self-update (built)
+
+- release-please (`.github/workflows/release.yml`, `release-please-config.json`) keeps a release PR open from Conventional Commits; merging it creates tag `vX.Y.Z` and a GitHub release.
+- The same workflow builds `kex-<target>.tar.gz` / `.zip` + `.sha256` for aarch64/x86_64 macOS, Linux (musl, static) and Windows, and uploads them to the release.
+- `install.sh` / `install.ps1` install the latest release (checksum verified).
+- `kex update` downloads the archive for this platform with `curl`, checks the sha256, unpacks with `tar` and replaces the running binary (on Windows the old exe is renamed away first). Installs from Homebrew/Scoop/winget are told to use their package manager.
+- Version check: at most once a day, a detached `kex update --check --quiet` refreshes `update.json` in the kex folder; commands never wait on the network. When a newer version is known, kex prints a note after the command (stderr; an `update_available` event in JSON mode) and the menu shows an "update" entry. Off with `KEX_NO_UPDATE_CHECK=1` and in CI.

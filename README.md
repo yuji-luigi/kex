@@ -21,13 +21,23 @@ $ kex run
 
 ## Install
 
-From source (needs [Rust](https://rustup.rs)):
+macOS / Linux:
 
 ```
-cargo install --git https://github.com/yuji-luigi/kex
+curl -fsSL https://raw.githubusercontent.com/yuji-luigi/kex/main/install.sh | sh
 ```
 
-Homebrew, winget/Scoop and prebuilt binaries will follow with the first release.
+Windows (PowerShell):
+
+```
+irm https://raw.githubusercontent.com/yuji-luigi/kex/main/install.ps1 | iex
+```
+
+From source (needs [Rust](https://rustup.rs)): `cargo install --git https://github.com/yuji-luigi/kex`
+
+Update with `kex update`. kex checks for a new release once a day in the background, prints
+a note after a command when one is out, and the `kex` menu offers an "update" entry.
+Set `KEX_NO_UPDATE_CHECK=1` to turn the check off.
 
 For PR features, also install the [GitHub CLI](https://cli.github.com/) and run `gh auth login`.
 
@@ -58,6 +68,7 @@ If a repo lives far from the others, run `kex scan ~/Development` once, or `kex 
 | `kex push` | pick repos, push each one's current branch |
 | `kex doctor` | what kex found: paths, ids, remotes, hosting, `gh` state |
 | `kex init --reset` | new ids for a config copied from another repo |
+| `kex update` | install the latest release (`--check` only reports) |
 | `kex completions zsh` | shell completions (bash, zsh, fish, powershell) |
 
 kex never commits, force-pushes, rebases or merges on its own. Protected branches always
@@ -96,6 +107,59 @@ Personal overrides go in `kex.local.json` next to `kex.json`. It's git-ignored b
 and holds only `run`.
 
 Exit codes: 0 ok, 1 some repo failed, 2 error, 3 missing tool, 130 cancelled.
+
+## JSON mode (for other programs)
+
+Full reference with TypeScript types for every message: [docs/json-protocol.md](docs/json-protocol.md).
+
+Add `--json` to any command and stdout becomes a stream of JSON objects, one per line,
+with nothing else mixed in (output of tools kex starts, like `git push`, goes to stderr).
+Every question turns into a `prompt` event; answer it with one line on stdin.
+
+```
+$ kex run --json
+{"type":"hello","kex":"0.2.0","protocol":1}
+{"type":"project","id":"acme-shop-7f3kq2","repos":[…],"missing":[],"warnings":[]}
+{"type":"prompt","id":"p1","kind":"multiselect","message":"Run which repos?","default":[0,1],
+ "options":[{"index":0,"value":"api","label":"api …","data":{"runtime":"node · pnpm run dev","port":3000,…}},
+            {"index":1,"value":"web","label":"web …","data":{…}}]}
+← {"id":"p1","answer":["api"]}
+{"type":"started","repo":"api","cmd":"pnpm run dev","pid":4242,"path":"…"}
+{"type":"output","repo":"api","stream":"stdout","line":"listening on :3000"}
+{"type":"ready","repo":"api","url":"http://localhost:3000"}
+← {"type":"stop"}
+{"type":"exited","repo":"api","code":0,"success":true}
+{"type":"exit","code":0}
+```
+
+Answers:
+
+| prompt `kind` | `answer` |
+|---|---|
+| `select` | option `index` or `value` (`null` = skip / back) |
+| `multiselect` | array of indexes or values, `"all"`, `"default"` |
+| `confirm` | `true` / `false` |
+| `text` | a string (`null` = the `default`) |
+
+`{"answer": …}` may leave out `id`; a bare JSON value or plain text line works too.
+`{"cancel":true}` (or closing stdin) cancels, exit code 130. An invalid answer gets an
+`error` event with the prompt's `id`, and kex waits for another line.
+
+While `kex run` is running, stdin takes `{"type":"input","repo":"app","text":"r"}` (typed
+into that service; `repo` defaults to the Flutter one, so `r` / `R` / `q` work) and
+`{"type":"stop"}`.
+
+Events: `hello`, `project`, `log` (`level`, `text`: everything a person would see),
+`prompt`, `error`, `pull` (per repo, with `unmerged` branches), `status`, `prs`, `merged`,
+`pushed`, `started`, `output`, `ready`, `exited`, `version`, `update_available`, `updated`,
+and always `exit` (`code`) last.
+
+## Releases
+
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`,
+`fix:`, …). [release-please](https://github.com/googleapis/release-please) keeps a release PR
+open with the changelog and version bump; merging it tags the release and CI attaches
+binaries for macOS, Linux and Windows (x86_64 and arm64), which `kex update` installs.
 
 ## License
 

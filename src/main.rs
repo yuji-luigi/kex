@@ -1,3 +1,5 @@
+#[macro_use]
+mod ui;
 mod config;
 mod doctor;
 mod flutter;
@@ -10,6 +12,7 @@ mod pull;
 mod push;
 mod registry;
 mod run;
+mod update;
 mod util;
 
 use std::path::PathBuf;
@@ -24,6 +27,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "kex", version)]
 struct Cli {
+    /// Machine-readable output: one JSON event per line on stdout; questions become
+    /// `prompt` events answered with one JSON line on stdin (see README)
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -55,10 +62,7 @@ enum Cmd {
         prime: bool,
     },
     /// Branch, ahead/behind and changed files of every repo
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
+    Status,
     /// Start every repo (runtime detected from its files)
     Run {
         /// Only these repos, e.g. api,web
@@ -99,6 +103,18 @@ enum Cmd {
     Link { path: PathBuf },
     /// Print shell completions
     Completions { shell: clap_complete::Shell },
+    /// Install the latest kex release
+    Update {
+        /// Only report whether a new version exists
+        #[arg(long)]
+        check: bool,
+        /// Don't ask before installing
+        #[arg(long, short)]
+        yes: bool,
+        /// Refresh the version cache silently (used by the background check)
+        #[arg(long, hide = true)]
+        quiet: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -112,20 +128,46 @@ enum PrCmd {
 }
 
 fn main() -> ExitCode {
-    match dispatch(Cli::parse().command) {
-        Ok(code) => ExitCode::from(code),
-        Err(e) => {
-            if let Some(
-                inquire::InquireError::OperationCanceled
-                | inquire::InquireError::OperationInterrupted,
-            ) = e.downcast_ref::<inquire::InquireError>()
-            {
-                return ExitCode::from(130);
-            }
-            eprintln!("kex: {e:#}");
-            ExitCode::from(2)
-        }
+    let cli = Cli::parse();
+    if cli.json {
+        ui::set_json();
+        ui::emit(
+            "hello",
+            serde_json::json!({ "kex": env!("CARGO_PKG_VERSION"), "protocol": ui::PROTOCOL }),
+        );
     }
+    let notify = !matches!(
+        cli.command,
+        Some(Cmd::Update { .. } | Cmd::Completions { .. })
+    );
+    let code = match dispatch(cli.command) {
+        Ok(code) => code,
+        Err(e) => {
+            let cancelled = e.downcast_ref::<ui::Cancelled>().is_some()
+                || matches!(
+                    e.downcast_ref::<inquire::InquireError>(),
+                    Some(
+                        inquire::InquireError::OperationCanceled
+                            | inquire::InquireError::OperationInterrupted
+                    )
+                );
+            if cancelled {
+                130
+            } else {
+                if ui::json() {
+                    ui::emit("error", serde_json::json!({ "message": format!("{e:#}") }));
+                } else {
+                    eprintln!("kex: {e:#}");
+                }
+                2
+            }
+        }
+    };
+    if notify && code != 130 {
+        update::notice();
+    }
+    ui::event("exit", serde_json::json!({ "code": code }));
+    ExitCode::from(code)
 }
 
 fn dispatch(cmd: Option<Cmd>) -> Result<u8> {
@@ -143,7 +185,7 @@ fn dispatch(cmd: Option<Cmd>) -> Result<u8> {
             reset,
         }),
         Some(Cmd::Pull { all, prime }) => pull::run(all, prime),
-        Some(Cmd::Status { json }) => pull::status(json),
+        Some(Cmd::Status) => pull::status(),
         Some(Cmd::Run {
             repos,
             no_update,
@@ -164,6 +206,7 @@ fn dispatch(cmd: Option<Cmd>) -> Result<u8> {
         Some(Cmd::Doctor) => doctor::doctor(),
         Some(Cmd::Scan { dir }) => doctor::scan(dir),
         Some(Cmd::Link { path }) => doctor::link(&path),
+        Some(Cmd::Update { check, yes, quiet }) => update::run(check, quiet, yes),
         Some(Cmd::Completions { shell }) => {
             clap_complete::generate(shell, &mut Cli::command(), "kex", &mut std::io::stdout());
             Ok(0)
@@ -182,16 +225,22 @@ fn menu() -> Result<u8> {
     } else {
         "  [needs gh]"
     };
-    let items = vec![
-        "pull      update all repos + show unmerged work".to_string(),
-        "run       start services".to_string(),
-        format!("pr check  review and merge PRs{gh_note}"),
-        "status    git status of every repo".to_string(),
-        "push      push current branch of selected repos".to_string(),
-        "doctor    what kex knows about this project".to_string(),
+    let mut items = vec![
+        ui::Opt::new("pull", "pull      update all repos + show unmerged work"),
+        ui::Opt::new("run", "run       start services"),
+        ui::Opt::new("pr", format!("pr check  review and merge PRs{gh_note}")),
+        ui::Opt::new("status", "status    git status of every repo"),
+        ui::Opt::new("push", "push      push current branch of selected repos"),
+        ui::Opt::new("doctor", "doctor    what kex knows about this project"),
     ];
-    let choice = inquire::Select::new("kex", items).raw_prompt()?;
-    dispatch(Some(match choice.index {
+    if let Some(v) = update::available() {
+        items.push(ui::Opt::new(
+            "update",
+            format!("update    install kex {v} (you have {})", update::CURRENT),
+        ));
+    }
+    let choice = ui::select_one("kex", &items)?;
+    dispatch(Some(match choice {
         0 => Cmd::Pull {
             all: false,
             prime: false,
@@ -206,11 +255,16 @@ fn menu() -> Result<u8> {
         2 => Cmd::Pr {
             command: PrCmd::Check { list: false },
         },
-        3 => Cmd::Status { json: false },
+        3 => Cmd::Status,
         4 => Cmd::Push {
             repos: None,
             yes: false,
         },
-        _ => Cmd::Doctor,
+        5 => Cmd::Doctor,
+        _ => Cmd::Update {
+            check: false,
+            yes: true,
+            quiet: false,
+        },
     }))
 }

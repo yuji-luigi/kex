@@ -29,7 +29,7 @@ pub fn kex_dir() -> PathBuf {
         .join("kex")
 }
 
-fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
+pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text)
             .with_context(|| format!("{} is not valid JSON; fix or delete it", path.display())),
@@ -39,7 +39,7 @@ fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 }
 
 /// Write to a temp file, then rename, so parallel kex processes never see half a file.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }

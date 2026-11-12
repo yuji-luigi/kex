@@ -5,14 +5,19 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// True when kex may ask questions (both stdin and stdout are a terminal).
+/// True when kex may ask questions: both stdin and stdout are a terminal, or `--json` (the
+/// questions then go out as `prompt` events).
 pub fn interactive() -> bool {
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    crate::ui::json() || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
 }
 
 fn color() -> bool {
     static COLOR: OnceLock<bool> = OnceLock::new();
-    *COLOR.get_or_init(|| std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal())
+    *COLOR.get_or_init(|| {
+        !crate::ui::json()
+            && std::env::var_os("NO_COLOR").is_none()
+            && std::io::stdout().is_terminal()
+    })
 }
 
 pub fn paint(code: &str, s: impl AsRef<str>) -> String {

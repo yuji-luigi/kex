@@ -13,7 +13,7 @@ pub fn doctor() -> Result<u8> {
     p.print_header();
     for r in &p.repos {
         let remote = git::shared_remote(&r.path);
-        println!(
+        say!(
             "  {} {:<8} {}",
             util::green("✓"),
             r.name,
@@ -24,7 +24,7 @@ pub fn doctor() -> Result<u8> {
         } else {
             ""
         };
-        println!("      branch    {}{wt}", git::current_branch(&r.path));
+        say!("      branch    {}{wt}", git::current_branch(&r.path));
         let cfg = match &r.config_path {
             Some(c) => util::tilde(c),
             None => format!(
@@ -32,20 +32,20 @@ pub fn doctor() -> Result<u8> {
                 r.prime().unwrap_or("?")
             ),
         };
-        println!("      config    {cfg}");
+        say!("      config    {cfg}");
         let root = match &r.root_commit {
             Some(c) => c.chars().take(10).collect(),
             None => "unknown (shallow clone?): identity falls back to repo_id + remote".to_string(),
         };
-        println!("      identity  {} · first commit {root}", r.repo_id);
+        say!("      identity  {} · first commit {root}", r.repo_id);
         let url = remote.as_deref().and_then(|n| git::remote_url(&r.path, n));
-        println!("      remote    {}", url.unwrap_or_else(|| "none".into()));
+        say!("      remote    {}", url.unwrap_or_else(|| "none".into()));
         let hosting = match gh::provider(r) {
             gh::Provider::GitHub => "GitHub (via gh)",
             gh::Provider::GitLab => "GitLab (not supported yet, PR features off)",
             gh::Provider::Unknown => "unknown host (PR features off)",
         };
-        println!("      hosting   {hosting}");
+        say!("      hosting   {hosting}");
         if let Some(remote) = &remote {
             for b in &r.config.prime_branches {
                 let exists = git::ok(
@@ -58,7 +58,7 @@ pub fn doctor() -> Result<u8> {
                     ],
                 );
                 if !exists {
-                    println!(
+                    say!(
                         "      {} prime branch {} not found on {remote}",
                         util::yellow("⚠"),
                         b.branch
@@ -73,8 +73,8 @@ pub fn doctor() -> Result<u8> {
     } else {
         util::yellow(gh::help(st))
     };
-    println!("gh        {gh_line}");
-    println!(
+    say!("gh        {gh_line}");
+    say!(
         "registry  {}",
         util::tilde(&registry::kex_dir().join("registry.json"))
     );
@@ -107,7 +107,7 @@ pub fn scan(dir: Option<PathBuf>) -> Result<u8> {
             continue;
         }
         if let Some(r) = project::open(&path, None).filter(|r| !r.worktree) {
-            println!(
+            say!(
                 "  {:<24} {:<8} {}",
                 r.config.project,
                 r.name,
@@ -123,7 +123,7 @@ pub fn scan(dir: Option<PathBuf>) -> Result<u8> {
         global.roots.push(dir.clone());
         global.save()?;
     }
-    println!(
+    say!(
         "found {n} kex repo{} under {} (now a search root)",
         if n == 1 { "" } else { "s" },
         util::tilde(&dir)
@@ -137,7 +137,7 @@ pub fn link(path: &Path) -> Result<u8> {
     let mut reg = Registry::load()?;
     register(&mut reg, &r);
     reg.save()?;
-    println!(
+    say!(
         "linked {} ({}) → {}",
         r.name,
         r.config.project,

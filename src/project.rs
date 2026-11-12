@@ -206,7 +206,7 @@ pub fn resolve(cwd: &Path) -> Result<Project> {
     }
     let warnings = duplicate_warnings(&repos);
     if let Err(e) = reg.save() {
-        eprintln!("kex: could not save the registry: {e:#}");
+        warn!("kex: could not save the registry: {e:#}");
     }
     Ok(Project {
         id,
@@ -315,33 +315,29 @@ impl Project {
             return Ok(r);
         }
         if !util::interactive() {
-            eprintln!(
+            warn!(
                 "kex: {name} has {} clones, using {}",
                 cs.len(),
                 util::tilde(&cs[0].path)
             );
             return Ok(cs[0]);
         }
-        let labels: Vec<String> = cs
+        let opts: Vec<crate::ui::Opt> = cs
             .iter()
             .map(|r| {
-                format!(
+                let label = format!(
                     "{} ({})",
                     util::tilde(&r.path),
                     git::current_branch(&r.path)
-                )
+                );
+                crate::ui::Opt::new(r.path.display().to_string(), label)
             })
             .collect();
-        let i = inquire::Select::new(
+        let i = crate::ui::select_one(
             &format!("{name} has {} clones. Which one?", cs.len()),
-            labels,
-        )
-        .raw_prompt()?
-        .index;
-        if inquire::Confirm::new("Remember this choice?")
-            .with_default(true)
-            .prompt()?
-        {
+            &opts,
+        )?;
+        if crate::ui::confirm("Remember this choice?", true)? {
             reg.preferred.insert(key, cs[i].path.clone());
             reg.save()?;
         }
@@ -349,12 +345,25 @@ impl Project {
     }
 
     pub fn print_header(&self) {
-        println!("{} {}", util::bold("project"), self.id);
+        crate::ui::event(
+            "project",
+            serde_json::json!({
+                "id": self.id,
+                "repos": self.repos.iter().map(|r| serde_json::json!({
+                    "repo": r.name, "path": r.path, "worktree": r.worktree,
+                })).collect::<Vec<_>>(),
+                "missing": self.missing.iter().map(|m| serde_json::json!({
+                    "repo": m.repo, "remote": m.remote,
+                })).collect::<Vec<_>>(),
+                "warnings": self.warnings,
+            }),
+        );
+        say!("{} {}", util::bold("project"), self.id);
         for w in &self.warnings {
-            eprintln!("{} {w}", util::yellow("⚠"));
+            warn!("{} {w}", util::yellow("⚠"));
         }
         for m in &self.missing {
-            println!(
+            say!(
                 "  {} {:<8} not on this machine ({})",
                 util::red("✗"),
                 m.repo,
