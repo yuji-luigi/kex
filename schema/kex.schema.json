@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/yuji-luigi/kex/main/schema/kex.schema.json",
+  "title": "kex.json",
+  "description": "Describes one repo of a multi-repo project for kex. Committed; the same for everyone.",
+  "type": "object",
+  "required": ["version", "project", "repo", "repo_id"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 1, "description": "Config format version." },
+    "project": { "type": "string", "description": "Project id shared by every repo of the project, e.g. acme-shop-7f3kq2. Made by `kex init`." },
+    "repo": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$", "description": "Short name of this repo inside the project, used in flags like --repos api,web." },
+    "repo_id": { "type": "string", "description": "Unique id of this repo. Made by `kex init`; never edit by hand." },
+    "hosting": {
+      "description": "Where the repo is hosted; picks the CLI for PR features. Detected from the remote when missing.",
+      "oneOf": [
+        { "type": "string", "examples": ["github.com"] },
+        {
+          "type": "object",
+          "required": ["domain"],
+          "additionalProperties": false,
+          "properties": {
+            "domain": { "type": "string" },
+            "provider": { "enum": ["github", "gitlab"] }
+          }
+        }
+      ]
+    },
+    "prime_branches": {
+      "type": "array",
+      "description": "The project's main branches. The first with stage \"dev\" is the default.",
+      "items": {
+        "type": "object",
+        "required": ["branch", "stage"],
+        "additionalProperties": false,
+        "properties": {
+          "branch": { "type": "string" },
+          "stage": { "enum": ["dev", "staging", "production"], "description": "\"production\" branches are protected." },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "protected": { "type": "array", "items": { "type": "string" }, "description": "Extra protected branches; * is a wildcard." },
+    "ignore_branches": { "type": "array", "items": { "type": "string" }, "description": "Branches left out of the unmerged report; * is a wildcard." },
+    "peers": {
+      "type": "array",
+      "description": "The other repos of the project, so kex can tell which ones aren't cloned.",
+      "items": {
+        "type": "object",
+        "required": ["repo", "remote"],
+        "additionalProperties": false,
+        "properties": {
+          "repo": { "type": "string" },
+          "remote": { "type": "string" }
+        }
+      }
+    },
+    "run": { "$ref": "#/$defs/run" }
+  },
+  "$defs": {
+    "command": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "default": { "type": "string" },
+            "macos": { "type": "string" },
+            "linux": { "type": "string" },
+            "windows": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "run": {
+      "type": "object",
+      "description": "Optional: how to run this repo. Detected from its files when missing.",
+      "additionalProperties": false,
+      "properties": {
+        "preset": { "enum": ["node", "flutter-ios"] },
+        "install": { "$ref": "#/$defs/command" },
+        "dev": { "$ref": "#/$defs/command" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "ready": { "type": "string", "description": "URL to wait for before printing \"ready\"." }
+      }
+    }
+  }
+}
