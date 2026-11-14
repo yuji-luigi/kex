@@ -10,8 +10,9 @@
     "$schema": { "type": "string" },
     "version": { "const": 1, "description": "Config format version." },
     "project": { "type": "string", "description": "Project id shared by every repo of the project, e.g. acme-shop-7f3kq2. Made by `kex init`." },
-    "repo": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$", "description": "Short name of this repo inside the project, used in flags like --repos api,web." },
+    "repo": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$", "minLength": 1, "maxLength": 40, "description": "Short name of this repo inside the project, used in flags like --repos api,web." },
     "repo_id": { "type": "string", "description": "Unique id of this repo. Made by `kex init`; never edit by hand." },
+    "description": { "type": "string", "maxLength": 200, "pattern": "^[^\\u0000-\\u001f\\u007f]*$", "description": "What this repo is, in a few words: one line, at most 200 characters. Optional; shown by `kex doctor` and `kex status --json`." },
     "hosting": {
       "description": "Where the repo is hosted; picks the CLI for PR features. Detected from the remote when missing.",
       "oneOf": [

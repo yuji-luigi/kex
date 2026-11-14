@@ -9,7 +9,6 @@ use crate::config::{self, Config, Peer, Stage};
 use crate::registry::{GlobalConfig, Registry};
 use crate::{git, util};
 
-const SKIP_DIRS: &[&str] = &["node_modules", "build", "dist", "target", "Pods", "vendor"];
 const DAY: u64 = 86_400;
 
 /// One checkout of a kex repo.
@@ -68,29 +67,6 @@ pub fn open(path: &Path, fallback_prime: Option<&str>) -> Option<Repo> {
             None,
         )),
         Err(_) => None,
-    }
-}
-
-/// Git repos under `dir`, up to `depth` levels down. Doesn't go into repos, hidden folders
-/// (so not into `.worktrees`, `.claude/worktrees`…) or build folders.
-pub fn find_git_dirs(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        if !e.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || SKIP_DIRS.contains(&name.as_str()) {
-            continue;
-        }
-        let p = e.path();
-        if p.join(".git").exists() {
-            out.push(p);
-        } else if depth > 1 {
-            find_git_dirs(&p, depth - 1, out);
-        }
     }
 }
 
@@ -157,10 +133,11 @@ pub fn resolve(cwd: &Path) -> Result<Project> {
     } else {
         current.path.clone()
     };
-    let mut candidates = Vec::new();
-    if let Some(g) = base.parent().and_then(Path::parent) {
-        find_git_dirs(g, 2, &mut candidates);
-    }
+    let candidates = base
+        .parent()
+        .and_then(Path::parent)
+        .map(|g| crate::tree::git_dirs(g, 2))
+        .unwrap_or_default();
     add_candidates(&id, candidates, &mut seen, &mut found);
 
     // Deep scan of the roots only when a peer is missing, at most once a day.
@@ -172,10 +149,10 @@ pub fn resolve(cwd: &Path) -> Result<Project> {
             .get(&id)
             .is_none_or(|t| util::now().saturating_sub(*t) > DAY);
         if !roots.is_empty() && due {
-            let mut c = Vec::new();
-            for r in &roots {
-                find_git_dirs(r, 4, &mut c);
-            }
+            let c: Vec<PathBuf> = roots
+                .iter()
+                .flat_map(|r| crate::tree::git_dirs(r, 4))
+                .collect();
             add_candidates(&id, c, &mut seen, &mut found);
             missing = missing_peers(&current, &found);
             if missing.is_empty() {

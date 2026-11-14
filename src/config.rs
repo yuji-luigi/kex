@@ -20,6 +20,9 @@ pub struct Config {
     pub project: String,
     pub repo: String,
     pub repo_id: String,
+    /// What this repo is, in a few words (optional; shown by `kex doctor`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosting: Option<Hosting>,
     #[serde(default)]

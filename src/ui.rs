@@ -13,6 +13,19 @@ use serde_json::{Value, json};
 
 pub const PROTOCOL: u32 = 1;
 
+/// What this kex can do, sent in `hello`. Stable strings, only ever added: a client checks
+/// for the one it needs instead of comparing versions (docs/json-protocol.md).
+pub const FEATURES: &[&str] = &[
+    "browse",
+    "from",
+    "dry_run",
+    "workspaces",
+    "pin_ids",
+    "paging",
+    "repos_only",
+    "no_git",
+];
+
 static JSON: AtomicBool = AtomicBool::new(false);
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -271,6 +284,27 @@ pub fn confirm(msg: &str, default: bool) -> Result<bool> {
         return Ok(a.unwrap_or(default));
     }
     Ok(inquire::Confirm::new(msg).with_default(default).prompt()?)
+}
+
+/// A terminal text question with an answer check: `check` says what's wrong (or `None`); a
+/// bad answer is explained and asked again. Not for JSON mode, where kex asks no free text
+/// that needs checking.
+pub fn text_checked(
+    msg: &str,
+    default: &str,
+    check: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
+    loop {
+        let s = inquire::Text::new(msg)
+            .with_default(default)
+            .prompt()?
+            .trim()
+            .to_string();
+        match check(&s) {
+            None => return Ok(s),
+            Some(problem) => warn(&problem),
+        }
+    }
 }
 
 pub fn text(msg: &str, default: Option<&str>) -> Result<String> {

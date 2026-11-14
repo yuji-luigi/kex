@@ -19,6 +19,9 @@ pub fn doctor() -> Result<u8> {
             r.name,
             util::tilde(&r.path)
         );
+        if let Some(d) = &r.config.description {
+            say!("      about     {d}");
+        }
         let wt = if r.worktree {
             "  (worktree: used for this command only)"
         } else {
@@ -98,8 +101,7 @@ pub fn scan(dir: Option<PathBuf>) -> Result<u8> {
         Some(d) => d,
         None => std::env::current_dir()?,
     });
-    let mut candidates = Vec::new();
-    project::find_git_dirs(&dir, 4, &mut candidates);
+    let candidates = crate::tree::git_dirs(&dir, 4);
     let mut reg = Registry::load()?;
     let mut n = 0;
     for path in candidates {

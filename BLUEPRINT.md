@@ -318,7 +318,43 @@ the project, since a union alone never forgets anything.
 
 ### 4.7 Helper commands
 
-- `kex init`: create the config (join an existing project or create one; always a new `repo_id`)
+- `kex init [dir]` (visible alias `kex add`): the one setup command. Every mode builds the
+  same request `--from` takes and hands it to `src/setup.rs`, which checks it (names, paths,
+  project, ids), plans and writes it; nothing else writes a `kex.json`. Modes
+  (`src/init.rs`): the terminal browser (default); `--yes` (this repo, or `DIR` when it is
+  one; joins the only project found next to it, else a new one; also plain `kex init`
+  without a terminal, as in 0.1); `--repos a,b` (folders next to this repo or in `DIR`);
+  `--workspace <file>`; `--from <file|->`. `--project` (an unknown id makes a project with
+  that id, except with `--from`), `--repo`, `--depth`, `--dry-run` (any mode), `--reset`
+  (unchanged). With `--json` it asks nothing: without one of those flags it's an error that
+  points to `kex browse --json` + `--from -`.
+  Terminal steps: (1) workspace file (`src/workspace.rs`, a `Format` trait; VS Code
+  `*.code-workspace`, JSONC, paths relative to the file) found in the folder, the repo or its
+  parent → "Use it?" → what it lists → "Init these N repos?" (no = the browser).
+  (2) Browser (`src/browse.rs` on `src/tree.rs`, the same listing as `kex browse`): a tree
+  `--depth` levels deep (default 3), breadth-first with a 200-entry cap (a folder with more
+  subfolders gets `… N more` page rows), repos are leaves, symlinks followed by real path;
+  Enter opens (new root) or checks, Space checks, `../`, Tab/`d` done, status line
+  `N selected: a, b, +K more`. (3) Project (inside a kex repo: its own; else join one of the
+  kex repos next to the picked ones, in the workspace file or seen while browsing, or a new
+  one). (4) Names confirmed together, else asked one by one with the same check `setup.rs`
+  applies. Every new config lists the existing members and the other new repos as `peers`.
+  Existing configs are not changed.
+- `--from` input: `[{path, name?, description?, repo_id?}]` or `{project?, repos}`; ids can
+  be pinned (`repo_id`, `{new, id}`), so a dry run's `plan.request` writes exactly the plan.
+  Everything is validated first (all problems reported as `error{index, field}`, exit 2),
+  already-in-project repos are skipped, `--dry-run` → `plan` event.
+- Writes (`setup.rs`): all or nothing. kex.json and the `.gitignore` line go to temp files
+  next to them and are renamed into place; the first failure undoes the run's writes
+  (exit 1, `added.rolled_back`); SIGINT/SIGTERM during the writes undo them too (exit 130);
+  the registry is saved after.
+- `kex browse [dir]`: the tree for programs (`tree` + `workspaces` events): symlinks not
+  followed, `--max-entries` (with `has_more`/`next_offset` and `--offset` paging for the
+  root's own list), `--hidden`, `--all`, `--repos-only`/`--flat` (every repo below, flat),
+  `--no-git` and `--git-budget-ms` (git fields within a time budget, `git_partial`);
+  `repos_below` counts the whole subtree within caps (`repos_below_truncated`); limits:
+  repo name 1–40, description ≤ 200 one line, project name 1–40; `hello.features`, per-repo branch/dirty/remote/last commit/
+  stack. Integration guide: docs/gui-integration.md.
 - `kex link <path>`: register a repo by hand
 - `kex scan [dir]`: index every kex repo under a folder
 - `kex doctor`: project, paths, clones, ignored worktrees, duplicates, missing peers, prime branches that don't exist on the remote, `gh` state
@@ -336,6 +372,7 @@ $ kex
   status    git status of every repo
   push      push current branch of selected repos
   pr check  review and merge PRs                    [needs gh]
+  add       set up more repos of this project
 ```
 
 ### 5.2 `kex pull` (C1, C2)
@@ -594,6 +631,7 @@ Platform priority: features are built and tested on **macOS first**. Windows and
 Built and tested (unit tests + end-to-end tests on real git repos; compiles for macOS, Windows and Linux):
 
 - `kex init` (join a project found next to the repo or create one, `--reset` for copied configs), `kex doctor`, `kex scan`, `kex link`
+- Later: `kex init` sets up several repos (terminal tree browser, workspace files, `--repos`; alias `kex add`), `--from` with `--dry-run` (all or nothing, one writer for every mode), `kex browse`, optional `description` in kex.json
 - Discovery: registry, siblings always, deep scan of `roots` at most once a day on a miss, worktrees ignored except the current one, config read from the prime branch when the checked-out branch has none
 - `kex pull` (parallel fetch, fast-forward only, unmerged report from the shared remote, `gh` lookup of merged PRs), `kex status` (`--json`)
 - `kex run`: detection (node via `packageManager`/lockfile, `flutter-ios`), `run` overrides, `kex.local.json`, install only when the lockfile changed, port check, prefixed output, Ctrl-C stops all, `ready` URL, PowerShell on Windows
@@ -614,7 +652,7 @@ Added after v0.1:
 - `--json` (global): one JSON event per line, every `inquire` question also available as a `prompt` event (`src/ui.rs`); `kex run` takes `input` / `stop` messages on stdin. Protocol version 1.
 - Releases (§8.5).
 
-Not built yet: `--dry-run`, run logs, `kex doctor --prune`, `kex clone`, Homebrew tap, winget/Scoop.
+Not built yet: `--dry-run` outside `--from`, run logs, `kex doctor --prune`, `kex clone`, Homebrew tap, winget/Scoop.
 
 ### 8.5 Releases and self-update (built)
 

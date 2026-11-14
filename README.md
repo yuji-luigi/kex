@@ -43,18 +43,46 @@ For PR features, also install the [GitHub CLI](https://cli.github.com/) and run 
 
 ## Set up a project
 
-In each repo of the project:
+Run `kex init` in any repo of the project, then pick the folders:
 
 ```
 kex init
 ```
 
-The first repo creates the project. The others find it next to them and join it. Commit the
-generated `kex.json`. Each teammate can keep their own folder layout: kex finds the repos by
+kex shows the folders around the repo as a tree, 3 levels deep, with the repo you're in
+already checked. ↑/↓ move, Space checks a repo, Enter opens a folder (it becomes the top of
+the tree) or checks a repo, ←/Backspace goes to `../`, Tab (or `d`) is done, Esc cancels.
+Repos show their branch; kex repos show their project and can't be checked. kex then asks
+for the project (join one found nearby, or a new one) and the repo names, and writes a
+`kex.json` in each checked repo, all or nothing, each listing the others as `peers`.
+
+```
+? Init which repos? ~/work/shop
+  ✓ Done (2 selected)
+  ../
+      ├─ admin           kex: shop-7f3kq2
+  [x] ├─ api             dev
+      ├─ clients/        3 repos
+      │  └─ acme/        1 repo
+  [ ] │     └─ portal    main
+  [x] └─ web             main
+2 selected: api, web
+↑↓ move · enter open/check · space check · ← ../ · tab done · esc cancel
+```
+
+When a VS Code workspace file (`*.code-workspace`, also Cursor's) is in the folder, in the
+repo or next to it, kex offers its repos first (no = the browser). Without the browser:
+`--yes` sets up just this repo · `--repos api,web` these folders next to it · `--workspace
+<file>` a workspace file's repos · `--from <file|->` a JSON list (for programs). `kex add`
+is the same command.
+
+Commit the generated `kex.json`. Each teammate can keep their own folder layout: kex finds the repos by
 the ids in `kex.json` and remembers where they are on each machine. That memory lives in
 `~/.config/kex/` (`%APPDATA%\kex` on Windows) and is never committed.
 
-If a repo lives far from the others, run `kex scan ~/Development` once, or `kex link <path>`.
+Unusual layouts: if a repo lives far from the others, run `kex scan ~/Development` once,
+or `kex link <path>`. Programs (GUIs) list folders with `kex browse --json` and set repos up
+with `kex init --from -`; see [docs/gui-integration.md](docs/gui-integration.md).
 
 ## Commands
 
@@ -67,6 +95,8 @@ If a repo lives far from the others, run `kex scan ~/Development` once, or `kex 
 | `kex status` | branch, ahead/behind and changes of every repo (`--json`) |
 | `kex push` | pick repos, push each one's current branch |
 | `kex doctor` | what kex found: paths, ids, remotes, hosting, `gh` state |
+| `kex init [dir]` (alias `add`) | set up repos: pick them in a tree; `--yes`, `--repos`, `--workspace`, `--from` skip it; `--dry-run` previews |
+| `kex browse [dir]` | folders as a tree with their repos, and workspace files (`--json` for programs; `--repos-only`, `--no-git`) |
 | `kex init --reset` | new ids for a config copied from another repo |
 | `kex update` | install the latest release (`--check` only reports) |
 | `kex completions zsh` | shell completions (bash, zsh, fish, powershell) |
@@ -83,6 +113,7 @@ need a typed confirmation.
   "project": "acme-shop-7f3kq2",
   "repo": "api",
   "repo_id": "r_9xk2mq",
+  "description": "Orders and payments API",
   "prime_branches": [
     { "branch": "dev", "stage": "dev", "description": "Integration branch" },
     { "branch": "main", "stage": "production", "description": "Live" }
@@ -90,7 +121,8 @@ need a typed confirmation.
 }
 ```
 
-`run` is optional. kex detects:
+`description` (optional) is shown by `kex doctor` and `kex status --json`. `run` is
+optional. kex detects:
 
 - **node** from `package.json`. The package manager comes from `packageManager` or the
   lockfile, the script from `dev`, `start` or `serve`, and the port from `PORT=` in `.env`.
@@ -118,7 +150,7 @@ Every question turns into a `prompt` event; answer it with one line on stdin.
 
 ```
 $ kex run --json
-{"type":"hello","kex":"0.2.0","protocol":1}
+{"type":"hello","kex":"0.2.0","protocol":1,"features":["browse","from",…]}
 {"type":"project","id":"acme-shop-7f3kq2","repos":[…],"missing":[],"warnings":[]}
 {"type":"prompt","id":"p1","kind":"multiselect","message":"Run which repos?","default":[0,1],
  "options":[{"index":0,"value":"api","label":"api …","data":{"runtime":"node · pnpm run dev","port":3000,…}},
@@ -149,9 +181,10 @@ While `kex run` is running, stdin takes `{"type":"input","repo":"app","text":"r"
 into that service; `repo` defaults to the Flutter one, so `r` / `R` / `q` work) and
 `{"type":"stop"}`.
 
-Events: `hello`, `project`, `log` (`level`, `text`: everything a person would see),
+`hello` carries `features` (e.g. `"browse"`, `"from"`): check those to know what this kex
+can do, rather than its version. Events: `hello`, `project`, `log` (`level`, `text`: everything a person would see),
 `prompt`, `error`, `pull` (per repo, with `unmerged` branches), `status`, `prs`, `merged`,
-`pushed`, `started`, `output`, `ready`, `exited`, `version`, `update_available`, `updated`,
+`pushed`, `added`, `tree`, `workspaces`, `plan`, `started`, `output`, `ready`, `exited`, `version`, `update_available`, `updated`,
 and always `exit` (`code`) last.
 
 ## Releases

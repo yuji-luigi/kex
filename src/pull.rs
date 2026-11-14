@@ -311,6 +311,7 @@ pub fn status() -> Result<u8> {
                 serde_json::json!({
                     "repo": r.name, "path": r.path, "branch": branch, "upstream": up,
                     "ahead": ahead, "behind": behind, "changed": changed, "worktree": r.worktree,
+                    "description": r.config.description,
                 })
             })
             .collect();

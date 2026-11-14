@@ -1,5 +1,6 @@
 #[macro_use]
 mod ui;
+mod browse;
 mod config;
 mod doctor;
 mod flutter;
@@ -12,8 +13,11 @@ mod pull;
 mod push;
 mod registry;
 mod run;
+mod setup;
+mod tree;
 mod update;
 mod util;
+mod workspace;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -37,20 +41,71 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create kex.json in this repo (join a project next to it, or create one)
+    /// Set up repos for kex: pick them in a folder browser (this repo starts checked);
+    /// --yes sets up only this repo
+    #[command(visible_alias = "add")]
     Init {
-        /// Project id to join
+        /// Folder to browse (default: the folder around this repo); with --yes, the repo to
+        /// set up
+        dir: Option<PathBuf>,
+        /// Project id to join (default: this repo's project, or ask)
         #[arg(long)]
         project: Option<String>,
-        /// Short repo name, used in flags like --repos
-        #[arg(long)]
+        /// Repo name, used in flags like --repos (sets up only this repo)
+        #[arg(long, conflicts_with_all = ["repos", "workspace"])]
         repo: Option<String>,
-        /// Don't ask; use detected defaults
+        /// Don't ask; set up only this repo with detected defaults
         #[arg(long, short)]
         yes: bool,
         /// Give an existing (copied) config a new repo_id and name
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["from", "workspace", "repos"])]
         reset: bool,
+        /// Set up these folders (next to this repo, or in DIR), e.g. api,web; no browser
+        #[arg(long, value_delimiter = ',', conflicts_with = "workspace")]
+        repos: Option<Vec<String>>,
+        /// Take the repos from this workspace file (*.code-workspace)
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Set up the repos listed in this JSON file (`-` = stdin), asking nothing
+        #[arg(long, value_name = "FILE|-", conflicts_with_all = ["dir", "repo", "repos", "workspace"])]
+        from: Option<String>,
+        /// Only print what would be written
+        #[arg(long)]
+        dry_run: bool,
+        /// How many folder levels the browser shows
+        #[arg(long, default_value_t = 3)]
+        depth: u32,
+    },
+    /// List a folder as a tree with its git repos, and the workspace files around it
+    /// (for programs: with --json it asks nothing)
+    Browse {
+        /// Folder to list (default: the current one)
+        dir: Option<PathBuf>,
+        /// How many levels below it to list (default 3; with --repos-only: no limit)
+        #[arg(long)]
+        depth: Option<u32>,
+        /// Stop after this many entries (the rest is marked truncated)
+        #[arg(long, default_value_t = 500)]
+        max_entries: usize,
+        /// Only the git repos below DIR, at any depth, as a flat list
+        #[arg(long, visible_alias = "flat")]
+        repos_only: bool,
+        /// Don't read branch, changed files, remote and last commit (fast)
+        #[arg(long)]
+        no_git: bool,
+        /// Stop reading git fields after this many milliseconds (0 = no limit)
+        #[arg(long, default_value_t = 5000)]
+        git_budget_ms: u64,
+        /// Show dot-folders
+        #[arg(long)]
+        hidden: bool,
+        /// Also list node_modules, target, build, dist, Pods and vendor (dot-folders like
+        /// .git and .dart_tool also need --hidden)
+        #[arg(long)]
+        all: bool,
+        /// Skip this many of DIR's own subfolders: the next page, from `next_offset`
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
     /// Update every repo and show unmerged work
     Pull {
@@ -133,7 +188,11 @@ fn main() -> ExitCode {
         ui::set_json();
         ui::emit(
             "hello",
-            serde_json::json!({ "kex": env!("CARGO_PKG_VERSION"), "protocol": ui::PROTOCOL }),
+            serde_json::json!({
+                "kex": env!("CARGO_PKG_VERSION"),
+                "protocol": ui::PROTOCOL,
+                "features": ui::FEATURES,
+            }),
         );
     }
     let notify = !matches!(
@@ -174,15 +233,48 @@ fn dispatch(cmd: Option<Cmd>) -> Result<u8> {
     match cmd {
         None => menu(),
         Some(Cmd::Init {
+            dir,
             project,
             repo,
             yes,
             reset,
+            repos,
+            workspace,
+            from,
+            dry_run,
+            depth,
         }) => init::run(init::Opts {
+            dir,
             project,
             repo,
             yes,
             reset,
+            repos,
+            workspace,
+            from,
+            dry_run,
+            depth,
+        }),
+        Some(Cmd::Browse {
+            dir,
+            depth,
+            max_entries,
+            hidden,
+            all,
+            offset,
+            repos_only,
+            no_git,
+            git_budget_ms,
+        }) => browse::command(browse::BrowseOpts {
+            dir,
+            depth,
+            repos_only,
+            git: !no_git,
+            git_budget_ms,
+            max_entries,
+            hidden,
+            all,
+            offset,
         }),
         Some(Cmd::Pull { all, prime }) => pull::run(all, prime),
         Some(Cmd::Status) => pull::status(),
@@ -240,27 +332,27 @@ fn menu() -> Result<u8> {
         ));
     }
     let choice = ui::select_one("kex", &items)?;
-    dispatch(Some(match choice {
-        0 => Cmd::Pull {
+    dispatch(Some(match items[choice].value.as_str() {
+        "pull" => Cmd::Pull {
             all: false,
             prime: false,
         },
-        1 => Cmd::Run {
+        "run" => Cmd::Run {
             repos: None,
             no_update: false,
             install: false,
             sim: None,
             force: false,
         },
-        2 => Cmd::Pr {
+        "pr" => Cmd::Pr {
             command: PrCmd::Check { list: false },
         },
-        3 => Cmd::Status,
-        4 => Cmd::Push {
+        "status" => Cmd::Status,
+        "push" => Cmd::Push {
             repos: None,
             yes: false,
         },
-        5 => Cmd::Doctor,
+        "doctor" => Cmd::Doctor,
         _ => Cmd::Update {
             check: false,
             yes: true,
