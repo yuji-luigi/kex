@@ -746,7 +746,7 @@ fn browse_lists_a_tree_for_programs() {
     // The request is echoed: resolved root and depth.
     assert_eq!(
         t["root"],
-        fs::canonicalize(&shop).unwrap().to_str().unwrap()
+        dunce::canonicalize(&shop).unwrap().to_str().unwrap()
     );
     assert_eq!(t["depth"], 2);
     assert_eq!(t["truncated"], false);
@@ -819,7 +819,7 @@ fn browse_shows_symlinks_without_following_them() {
     assert_eq!(l["target_kind"], "repo");
     assert_eq!(
         l["target"],
-        fs::canonicalize(&ext).unwrap().to_str().unwrap()
+        dunce::canonicalize(&ext).unwrap().to_str().unwrap()
     );
     assert_eq!(tree_entry(&t["tree"], "dangling")["target_kind"], "missing");
 
@@ -1168,7 +1168,11 @@ fn a_workspace_file_listing_a_repo_twice_sets_it_up_once() {
     // A missing folder's path is still normalized.
     let gone = ws["folders"].as_array().unwrap().last().unwrap();
     assert!(
-        gone["resolved"].as_str().unwrap().ends_with("shop/gone"),
+        gone["resolved"]
+            .as_str()
+            .unwrap()
+            .replace('\\', "/")
+            .ends_with("shop/gone"),
         "{gone}"
     );
 
@@ -1392,7 +1396,7 @@ fn browse_counts_the_whole_subtree_and_lists_repos_flat() {
     );
     assert_eq!(
         d["path"],
-        fs::canonicalize(&deep).unwrap().to_str().unwrap()
+        dunce::canonicalize(&deep).unwrap().to_str().unwrap()
     );
     // --depth limits it; --max-entries caps it; --flat is the same.
     let ev = events(&env.kex_ok(&w, &["browse", "--flat", "--depth", "2", "--json"]));
