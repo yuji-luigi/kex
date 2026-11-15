@@ -1,6 +1,6 @@
 [package]
 name = "kex"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Pull, review and run all the repos of a multi-repo project"
 license = "Apache-2.0"
