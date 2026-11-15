@@ -1849,7 +1849,9 @@ fn every_example_line_in_the_docs_validates() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut n = 0;
     for doc in ["spec/cli-events-1.md", "docs/self-description.md"] {
-        let text = fs::read_to_string(root.join(doc)).unwrap();
+        let text = fs::read_to_string(root.join(doc))
+            .unwrap()
+            .replace("\r\n", "\n");
         for block in text.split("```ndjson\n").skip(1) {
             let block = block.split("```").next().unwrap();
             for line in block.lines() {
