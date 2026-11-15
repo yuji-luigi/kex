@@ -6,7 +6,9 @@ use std::process::Command;
 use anyhow::{Result, bail};
 
 use crate::project::{self, Repo};
-use crate::{git, ui, util};
+use serde_json::json;
+
+use crate::{git, ui, util, view};
 
 struct Item<'a> {
     repo: &'a Repo,
@@ -65,22 +67,41 @@ pub fn run(names: Option<Vec<String>>, yes: bool) -> Result<u8> {
             let opts: Vec<ui::Opt> = items
                 .iter()
                 .map(|it| {
-                    ui::Opt::new(&it.repo.name, describe(it)).data(serde_json::json!({
-                        "branch": it.branch, "ahead": it.ahead,
-                        "upstream": it.upstream, "dirty": it.dirty,
-                    }))
+                    let mut badges = Vec::new();
+                    if it.dirty {
+                        badges.push(view::badge("changes", "warn"));
+                    }
+                    if !it.upstream {
+                        badges.push(view::badge("new_branch", "muted"));
+                    }
+                    ui::Opt::new(&it.repo.name, describe(it))
+                        .data(json!({
+                            "branch": it.branch, "ahead": it.ahead,
+                            "upstream": it.upstream, "dirty": it.dirty,
+                        }))
+                        .row(json!({
+                            "cells": {
+                                "repo": it.repo.name, "branch": it.branch,
+                                "ahead": view::count(u64::from(it.ahead), "info"),
+                            },
+                            "badges": badges,
+                        }))
                 })
                 .collect();
             let preselected: Vec<usize> =
                 (0..items.len()).filter(|i| items[*i].ahead > 0).collect();
-            ui::multi_select(
-                "Push the current branch of which repos?",
-                &opts,
-                &preselected,
-            )?
-            .into_iter()
-            .map(|i| &items[i])
-            .collect()
+            let q = ui::Q::new("push.pick", serde_json::Value::Null).with(
+                "columns",
+                json!([
+                    view::col("repo", "text"),
+                    view::col("branch", "branch"),
+                    view::col("ahead", "count")
+                ]),
+            );
+            ui::multi_select(q, &opts, &preselected)?
+                .into_iter()
+                .map(|i| &items[i])
+                .collect()
         }
         None => bail!("no terminal to ask in: pass --repos a,b (and --yes)"),
     };
@@ -95,7 +116,7 @@ pub fn run(names: Option<Vec<String>>, yes: bool) -> Result<u8> {
         for it in &chosen {
             say!("  {}", describe(it));
         }
-        if !ui::confirm("Push these?", true)? {
+        if !ui::confirm(ui::Q::new("push.confirm", serde_json::Value::Null), true)? {
             return Ok(0);
         }
     }
@@ -122,13 +143,10 @@ pub fn run(names: Option<Vec<String>>, yes: bool) -> Result<u8> {
                 code = 1;
                 continue;
             }
-            let typed = ui::text(
-                &format!(
-                    "{name}: {} is protected. Type `{}` to push:",
-                    it.branch, it.branch
-                ),
-                None,
-            )?;
+            let q = ui::Q::new("push.typed", json!({ "repo": name, "branch": it.branch }))
+                .with("expect", json!(it.branch))
+                .with("tone", json!("danger"));
+            let typed = ui::text(q, None)?;
             if typed.trim() != it.branch {
                 say!("{name}: skipped");
                 continue;
@@ -139,18 +157,33 @@ pub fn run(names: Option<Vec<String>>, yes: bool) -> Result<u8> {
             util::bold("==>"),
             it.branch
         );
-        let ok = Command::new("git")
-            .args(["push", "-u", "origin", &it.branch])
-            .current_dir(&it.repo.path)
-            .stdout(ui::child_stdout())
-            .status()
-            .is_ok_and(|s| s.success());
+        let ok = crate::cancel::status(
+            Command::new("git")
+                .args(["push", "-u", "origin", &it.branch])
+                .current_dir(&it.repo.path)
+                .stdout(ui::child_stdout()),
+        )
+        .is_ok_and(|s| s.success());
+        let key = format!("push:{name}");
+        let params = json!({ "branch": it.branch, "repo": name });
+        let line = if ok {
+            view::note("win", view::msg("push.done", params))
+        } else {
+            view::note("error", view::msg("push.failed", params))
+        };
         ui::event(
             "pushed",
-            serde_json::json!({ "repo": name, "branch": it.branch, "ok": ok }),
+            json!({
+                "repo": name, "branch": it.branch, "ok": ok,
+                "key": key, "view": view::view("log", json!({ "lines": [line] })),
+            }),
         );
         if !ok {
-            say!("{} {name}: push failed", util::red("✗"));
+            ui::say_about(
+                &key,
+                "error",
+                &format!("{} {name}: push failed", util::red("✗")),
+            );
             code = 1;
         }
     }

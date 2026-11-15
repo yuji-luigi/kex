@@ -43,12 +43,12 @@ pub fn newer(a: &str, b: &str) -> bool {
 }
 
 fn curl(args: &[&str]) -> Result<Vec<u8>> {
-    let out = Command::new("curl")
-        .args(["-fsSL", "--proto", "=https", "--retry", "2"])
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .context("curl not found")?;
+    let out = crate::cancel::output(
+        Command::new("curl")
+            .args(["-fsSL", "--proto", "=https", "--retry", "2"])
+            .args(args),
+    )
+    .context("curl not found")?;
     if !out.status.success() {
         bail!(
             "download failed: {}",
@@ -132,7 +132,15 @@ pub fn notice() {
     if let Some(v) = available() {
         ui::event(
             "update_available",
-            serde_json::json!({ "current": CURRENT, "latest": v }),
+            serde_json::json!({
+                "current": CURRENT, "latest": v,
+                "key": "update_available",
+                "view": crate::view::view("card", serde_json::json!({
+                    "title": crate::view::msg("update.available", serde_json::json!({ "latest": v })),
+                    "tone": "info",
+                    "actions": [install_action(&v)],
+                })),
+            }),
         );
         if !ui::json() {
             eprintln!(
@@ -156,6 +164,17 @@ fn package_manager_hint(exe: &Path) -> Option<&'static str> {
     }
 }
 
+/// The "Install" button: runs `kex update --yes`, after the client's confirm.
+fn install_action(version: &str) -> serde_json::Value {
+    let p = serde_json::json!({ "version": version });
+    serde_json::json!({
+        "label": crate::view::msg("update.install", p.clone()),
+        "effect": "install",
+        "confirm": crate::view::msg("update.install_confirm", p),
+        "run": { "command": "update", "options": { "yes": true } },
+    })
+}
+
 pub fn run(check_only: bool, quiet: bool, yes: bool) -> Result<u8> {
     let latest = fetch_latest(if quiet { 5 } else { 15 });
     let mut cache: Cache = registry::read_json(&cache_path()).unwrap_or_default();
@@ -169,16 +188,41 @@ pub fn run(check_only: bool, quiet: bool, yes: bool) -> Result<u8> {
     }
     let latest = latest.context("could not check for a new version")?;
     let has_new = newer(&latest, CURRENT);
+    let (title, tone, actions) = if has_new {
+        let t = crate::view::msg("update.available", serde_json::json!({ "latest": latest }));
+        (t, "info", vec![install_action(&latest)])
+    } else {
+        let t = crate::view::msg("update.latest", serde_json::json!({ "current": CURRENT }));
+        (t, "ok", vec![])
+    };
     ui::event(
         "version",
-        serde_json::json!({ "current": CURRENT, "latest": latest, "update": has_new }),
+        serde_json::json!({
+            "current": CURRENT, "latest": latest, "update": has_new,
+            "key": "version",
+            "view": crate::view::view("card", serde_json::json!({
+                "title": title, "tone": tone,
+                "fields": [
+                    crate::view::field("installed", serde_json::json!(CURRENT), "code"),
+                    crate::view::field("latest", serde_json::json!(latest), "code"),
+                ],
+                "actions": actions,
+            })),
+        }),
     );
+    let about = |text: String| ui::say_about("version", "info", &text);
     if !has_new {
-        say!("{} kex {CURRENT} is the latest version", util::green("✓"));
+        let about = |text: String| ui::say_about("version", "win", &text);
+        about(format!(
+            "{} kex {CURRENT} is the latest version",
+            util::green("✓")
+        ));
         return Ok(0);
     }
-    say!("kex {latest} is available (you have {CURRENT})");
-    say!("  https://github.com/{REPO}/releases/tag/v{latest}");
+    about(format!("kex {latest} is available (you have {CURRENT})"));
+    about(format!(
+        "  https://github.com/{REPO}/releases/tag/v{latest}"
+    ));
     if check_only {
         return Ok(0);
     }
@@ -187,15 +231,30 @@ pub fn run(check_only: bool, quiet: bool, yes: bool) -> Result<u8> {
         say!("kex was installed with a package manager; update with `{cmd}`");
         return Ok(0);
     }
-    if !yes && util::interactive() && !ui::confirm(&format!("Install kex {latest}?"), true)? {
+    let q = ui::Q::new("update.confirm", serde_json::json!({ "version": latest }));
+    if !yes && util::interactive() && !ui::confirm(q, true)? {
         return Ok(0);
     }
     install(&latest, &exe)?;
-    ui::event("updated", serde_json::json!({ "version": latest }));
-    say!(
-        "{} kex {latest} installed to {}",
-        util::green("✓"),
-        util::tilde(&exe)
+    ui::event(
+        "updated",
+        serde_json::json!({
+            "version": latest,
+            "key": "version",
+            "view": crate::view::view("card", serde_json::json!({
+                "title": crate::view::msg("update.done", serde_json::json!({ "version": latest })),
+                "tone": "ok",
+            })),
+        }),
+    );
+    ui::say_about(
+        "version",
+        "win",
+        &format!(
+            "{} kex {latest} installed to {}",
+            util::green("✓"),
+            util::tilde(&exe)
+        ),
     );
     Ok(0)
 }
@@ -224,14 +283,15 @@ fn install(version: &str, exe: &Path) -> Result<()> {
     let result = (|| -> Result<()> {
         let file = work.join(&name);
         std::fs::write(&file, &archive)?;
-        let ok = Command::new("tar")
-            .arg("-xf")
-            .arg(&file)
-            .arg("-C")
-            .arg(&work)
-            .status()
-            .context("tar not found")?
-            .success();
+        let ok = crate::cancel::status(
+            Command::new("tar")
+                .arg("-xf")
+                .arg(&file)
+                .arg("-C")
+                .arg(&work),
+        )
+        .context("tar not found")?
+        .success();
         if !ok {
             bail!("could not unpack {name}");
         }

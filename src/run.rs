@@ -16,7 +16,10 @@ use anyhow::{Context, Result, bail};
 use crate::config;
 use crate::project::{self, Repo};
 use crate::registry::{GlobalConfig, Registry};
-use crate::{flutter, pull, ui, util};
+use crate::{flutter, pull, ui, util, view};
+
+/// Longest `output` line kex sends; longer ones are cut and end in `…` (cli-events §9).
+pub const MAX_LINE: usize = 16 * 1024;
 
 pub struct Opts {
     pub repos: Option<Vec<String>>,
@@ -223,27 +226,41 @@ pub fn run(o: Opts) -> Result<u8> {
             .map(|i| {
                 let x = &plans[*i];
                 let label = format!("{:<8} {:<28} ({})", x.repo.name, x.label, x.reason);
-                ui::Opt::new(&x.repo.name, label).data(serde_json::json!({
-                    "runtime": x.label, "reason": x.reason, "port": x.port,
-                    "path": x.repo.path,
-                }))
+                ui::Opt::new(&x.repo.name, label)
+                    .data(serde_json::json!({
+                        "runtime": x.label, "reason": x.reason, "port": x.port,
+                        "path": x.repo.path,
+                    }))
+                    .row(serde_json::json!({ "cells": {
+                        "repo": x.repo.name, "runtime": x.label, "port": x.port,
+                        "reason": x.reason,
+                    }}))
             })
             .collect();
         let all: Vec<usize> = (0..opts.len()).collect();
-        ui::multi_select("Run which repos?", &opts, &all)?
+        let q = ui::Q::new("run.pick", serde_json::Value::Null).with(
+            "columns",
+            serde_json::json!([
+                view::col("repo", "text"),
+                view::col("runtime", "code"),
+                view::col("port", "number"),
+                view::col("reason", "text"),
+            ]),
+        );
+        ui::multi_select(q, &opts, &all)?
             .into_iter()
             .map(|c| avail[c])
             .collect()
     } else {
         for i in &avail {
             let x = &plans[*i];
-            say!(
+            ui::say_win(&format!(
                 "  {} {:<8} {} ({})",
                 util::green("✓"),
                 x.repo.name,
                 x.label,
                 util::dim(&x.reason)
-            );
+            ));
         }
         avail.clone()
     };
@@ -301,19 +318,14 @@ pub fn run(o: Opts) -> Result<u8> {
 fn update_and_install(plans: &[&Plan], force: bool) -> Result<()> {
     let updates = util::parallel(plans, |pl| pull::update(pl.repo, false));
     for (pl, u) in plans.iter().zip(&updates) {
-        ui::event(
-            "pull",
-            serde_json::json!({
-                "repo": pl.repo.name, "path": pl.repo.path, "branch": u.branch,
-                "ok": u.ok, "status": ui::strip_ansi(&u.status),
-            }),
-        );
-        say!(
+        ui::event("pull", pull::event(pl.repo, u, None));
+        let line = format!(
             "{} ({}) {}",
             util::bold(format!("== {}", pl.repo.name)),
             u.branch,
             u.status
         );
+        ui::say_about(&pull::key(pl.repo), "info", &line);
     }
     let mut reg = Registry::load()?;
     for pl in plans {
@@ -334,11 +346,12 @@ fn update_and_install(plans: &[&Plan], force: bool) -> Result<()> {
             continue;
         }
         say!("{} {}: {cmd}", util::bold("==>"), pl.repo.name);
-        let st = shell(cmd)
-            .current_dir(&pl.repo.path)
-            .stdout(ui::child_stdout())
-            .status()
-            .with_context(|| format!("running {cmd}"))?;
+        let st = crate::cancel::status(
+            shell(cmd)
+                .current_dir(&pl.repo.path)
+                .stdout(ui::child_stdout()),
+        )
+        .with_context(|| format!("running {cmd}"))?;
         if !st.success() {
             bail!("{}: `{cmd}` failed", pl.repo.name);
         }
@@ -368,8 +381,13 @@ fn supervise(services: Vec<Service>) -> Result<u8> {
     {
         let stop = stop.clone();
         // Children share the terminal, so they get Ctrl-C too; kex only waits, then cleans up.
+        // (In JSON mode the process-wide handler is already set: `crate::cancel`.)
         let _ = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst));
     }
+    // JSON mode: SIGINT / SIGTERM only flag `cancel::cancelled()` while kex supervises; the
+    // services are stopped as for a Stop line, and the run ends 130 (cancelled).
+    let _cooperative = crate::cancel::Cooperative::enter();
+    let stopping = || stop.load(Ordering::SeqCst) || crate::cancel::cancelled();
     let width = services.iter().map(|s| s.name.len()).max().unwrap_or(0);
     let json = ui::json();
     // JSON mode: stdin carries `input` / `stop` messages, forwarded to the services.
@@ -407,9 +425,40 @@ fn supervise(services: Vec<Service>) -> Result<u8> {
                 continue;
             }
         };
+        // Flutter reads r / R / q: buttons for them. A service kex won't see answer on a
+        // URL is running as soon as it started.
+        let actions: Vec<serde_json::Value> = if s.pidfile.is_some() {
+            [
+                ("run.hot_reload", "r"),
+                ("run.hot_restart", "R"),
+                ("run.quit_app", "q"),
+            ]
+            .iter()
+            .map(|(id, key)| {
+                serde_json::json!({
+                    "label": view::m(id),
+                    "send": { "type": "input", "repo": s.name, "text": key },
+                })
+            })
+            .collect()
+        } else {
+            Vec::new()
+        };
+        let state = if s.ready.is_some() {
+            "starting"
+        } else {
+            "running"
+        };
         ui::event(
             "started",
-            serde_json::json!({ "repo": s.name, "cmd": s.cmd, "pid": child.id(), "path": s.dir }),
+            serde_json::json!({
+                "repo": s.name, "cmd": s.cmd, "pid": child.id(), "path": s.dir,
+                "key": service_key(&s.name),
+                "view": view::view("service", serde_json::json!({
+                    "name": s.name, "state": state, "command": s.cmd, "pid": child.id(),
+                    "actions": actions,
+                })),
+            }),
         );
         if let Some(stdin) = child.stdin.take() {
             inputs.lock().unwrap().insert(s.name.clone(), stdin);
@@ -460,12 +509,25 @@ fn supervise(services: Vec<Service>) -> Result<u8> {
                 && let Ok(Some(st)) = ch.try_wait()
             {
                 done[i] = true;
-                if !st.success() && !stop.load(Ordering::SeqCst) {
+                if !st.success() && !stopping() {
                     code = 1;
                 }
+                // Stopped by Stop or a signal: an ordinary end, not a failure.
+                let (state, tone) = if st.success() || stopping() {
+                    ("exited", "muted")
+                } else {
+                    ("failed", "danger")
+                };
                 ui::event(
                     "exited",
-                    serde_json::json!({ "repo": name, "code": st.code(), "success": st.success() }),
+                    serde_json::json!({
+                        "repo": name, "code": st.code(), "success": st.success(),
+                        "key": service_key(name),
+                        "view": view::view("service", serde_json::json!({
+                            "mode": "append", "state": state, "exit_code": st.code(),
+                            "tone": tone,
+                        })),
+                    }),
                 );
                 say!("{prefix} {}", util::dim(format!("exited ({st})")));
             }
@@ -473,7 +535,23 @@ fn supervise(services: Vec<Service>) -> Result<u8> {
         if done.iter().all(|d| *d) {
             break;
         }
-        if stop.load(Ordering::SeqCst) {
+        if stopping() {
+            if stop_at.is_none() {
+                for (i, (_, name, _)) in children.iter().enumerate() {
+                    if !done[i] {
+                        ui::event(
+                            "stopping",
+                            serde_json::json!({
+                                "repo": name,
+                                "key": service_key(name),
+                                "view": view::view("service", serde_json::json!({
+                                    "mode": "append", "state": "stopping",
+                                })),
+                            }),
+                        );
+                    }
+                }
+            }
             if stop_at.is_none() && json {
                 // No shared terminal sent Ctrl-C: interrupt the services ourselves.
                 inputs.lock().unwrap().clear();
@@ -495,7 +573,22 @@ fn supervise(services: Vec<Service>) -> Result<u8> {
         std::thread::sleep(Duration::from_millis(150));
     }
     drop(watchers);
-    Ok(code)
+    Ok(if crate::cancel::cancelled() {
+        130
+    } else {
+        code
+    })
+}
+
+/// A stdin line kex can't use during `kex run`: a `log` error (the run goes on), not a
+/// fatal `error`.
+fn reject(id: &str, params: serde_json::Value) {
+    let m = view::msg(id, params);
+    let mut v = serde_json::json!({ "level": "error" });
+    if let (Some(o), serde_json::Value::Object(f)) = (v.as_object_mut(), m) {
+        o.extend(f);
+    }
+    ui::emit("log", v);
 }
 
 /// JSON mode: `{"type":"input","repo":"app","text":"r"}` types into a service (default: the
@@ -513,10 +606,7 @@ fn read_commands(
             return; // closed: keep running, Ctrl-C / SIGTERM still work
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            ui::emit(
-                "error",
-                serde_json::json!({ "message": "expected a JSON object" }),
-            );
+            reject("run.bad_line", serde_json::Value::Null);
             continue;
         };
         match v["type"].as_str() {
@@ -526,10 +616,7 @@ fn read_commands(
             }
             Some("input") => {
                 let Some(repo) = v["repo"].as_str().or(default) else {
-                    ui::emit(
-                        "error",
-                        serde_json::json!({ "message": "input needs \"repo\"" }),
-                    );
+                    reject("run.input_needs_repo", serde_json::Value::Null);
                     continue;
                 };
                 let text = v["text"].as_str().unwrap_or("");
@@ -538,16 +625,10 @@ fn read_commands(
                     Some(w) => {
                         let _ = w.write_all(text.as_bytes()).and_then(|_| w.flush());
                     }
-                    None => ui::emit(
-                        "error",
-                        serde_json::json!({ "message": format!("no running service \"{repo}\"") }),
-                    ),
+                    None => reject("run.no_service", serde_json::json!({ "repo": repo })),
                 }
             }
-            _ => ui::emit(
-                "error",
-                serde_json::json!({ "message": "unknown message; expected type input or stop" }),
-            ),
+            _ => reject("run.unknown_message", serde_json::Value::Null),
         }
     }
 }
@@ -572,10 +653,17 @@ fn pipe(stream: Box<dyn Read + Send>, prefix: &str, name: &str, kind: &str) {
             Ok(_) => {
                 let line = String::from_utf8_lossy(&buf);
                 if ui::json() {
-                    let text = ui::strip_ansi(line.trim_end_matches(['\n', '\r']));
+                    let text = cut(ui::strip_ansi(line.trim_end_matches(['\n', '\r'])));
                     ui::emit(
                         "output",
-                        serde_json::json!({ "repo": name, "stream": kind, "line": text }),
+                        serde_json::json!({
+                            "repo": name, "stream": kind, "line": text,
+                            "key": service_key(name),
+                            "view": view::view("service", serde_json::json!({
+                                "mode": "append",
+                                "lines": [{ "text": text, "stream": kind }],
+                            })),
+                        }),
                     );
                     continue;
                 }
@@ -584,6 +672,23 @@ fn pipe(stream: Box<dyn Read + Send>, prefix: &str, name: &str, kind: &str) {
             }
         }
     }
+}
+
+fn service_key(name: &str) -> String {
+    format!("run:{name}")
+}
+
+/// A line cut to [`MAX_LINE`] bytes (on a character boundary), ending in `…` when cut.
+fn cut(mut s: String) -> String {
+    if s.len() > MAX_LINE {
+        let mut end = MAX_LINE - '…'.len_utf8();
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+        s.push('…');
+    }
+    s
 }
 
 fn kill_tree(ch: &mut Child) {
@@ -621,7 +726,16 @@ fn wait_ready(url: &str, prefix: &str, name: &str, stop: &AtomicBool) {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(180) && !stop.load(Ordering::SeqCst) {
         if reachable(&addr, Duration::from_millis(300)) {
-            ui::event("ready", serde_json::json!({ "repo": name, "url": url }));
+            ui::event(
+                "ready",
+                serde_json::json!({
+                    "repo": name, "url": url,
+                    "key": service_key(name),
+                    "view": view::view("service", serde_json::json!({
+                        "mode": "append", "state": "ready", "url": url, "tone": "ok",
+                    })),
+                }),
+            );
             say!("{prefix} {}", util::green(format!("ready: {url}")));
             return;
         }
@@ -636,6 +750,14 @@ fn port_in_use(port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_output_lines_are_cut() {
+        assert_eq!(cut("abc".into()), "abc");
+        let long = "é".repeat(MAX_LINE);
+        let c = cut(long);
+        assert!(c.len() <= MAX_LINE && c.ends_with('…'), "{}", c.len());
+    }
 
     #[test]
     fn ready_urls() {

@@ -27,6 +27,7 @@ pub const SKIP: &[&str] = &[
     "vendor",
 ];
 
+#[derive(Clone)]
 pub struct Opts {
     /// Levels below the root to list: 1 = only its direct subfolders.
     pub depth: u32,
@@ -101,6 +102,53 @@ const FLAT_SCAN_CAP: usize = 20_000;
 /// Time the folder walks of one listing may take (`repos_below` counting, `--repos-only`);
 /// past it they stop and say so, like the caps above.
 pub const SCAN_BUDGET: Duration = Duration::from_secs(2);
+/// How long one folder may take to answer (opening it, looking at it). A folder on a
+/// hanging mount (autofs, a lost network share) is shown as unreadable instead.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// System folders a listing shows but doesn't look into from their parent (they are huge,
+/// virtual, or mount points that can hang, like macOS's autofs `/home`). Listing one of them
+/// directly still works.
+#[cfg(unix)]
+const SPECIAL: &[&str] = &[
+    "/dev",
+    "/proc",
+    "/sys",
+    "/System",
+    "/Volumes",
+    "/net",
+    "/Network",
+    "/cores",
+    "/private/var/vm",
+    "/System/Volumes/Data/home",
+    #[cfg(target_os = "macos")]
+    "/home",
+];
+#[cfg(not(unix))]
+const SPECIAL: &[&str] = &[];
+
+fn special(p: &Path) -> bool {
+    SPECIAL.iter().any(|s| p == Path::new(s))
+}
+
+/// `f` on another thread, waiting at most `d`. `None` when it didn't finish in time (the
+/// thread is left to finish on its own: a blocked filesystem call can't be interrupted).
+pub fn with_timeout<T: Send + 'static>(
+    d: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(d).ok()
+}
+
+/// [`read`] within [`PROBE_TIMEOUT`].
+fn read_bounded(dir: &Path, o: &Opts) -> Result<Vec<Raw>, String> {
+    let (dir, o) = (dir.to_path_buf(), o.clone());
+    with_timeout(PROBE_TIMEOUT, move || read(&dir, &o)).unwrap_or_else(|| Err("timed out".into()))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -306,6 +354,82 @@ fn worktree_main(dot_git: &Path) -> Option<PathBuf> {
     })?))
 }
 
+/// The entry for one listed folder (or link), within [`PROBE_TIMEOUT`]; a [`special`]
+/// folder isn't looked into.
+fn probe(r: Raw, level: u32, follow_links: bool) -> Entry {
+    let shell = |name: String, path: PathBuf| {
+        let mut e = Entry::bare(name, path, level);
+        e.truncated = true; // has (or may have) folders inside: open it to see
+        e
+    };
+    let is_link = r.link && !follow_links;
+    if special(&r.path) || r.target.as_deref().is_some_and(special) {
+        let mut e = shell(r.name, r.path);
+        if is_link {
+            e.kind = Kind::Symlink;
+            e.target_kind = Some("dir");
+            e.target = r.target;
+            e.truncated = false;
+        }
+        return e;
+    }
+    let (name, path) = (r.name.clone(), r.path.clone());
+    let probed = with_timeout(PROBE_TIMEOUT, move || {
+        if is_link {
+            let mut e = entry(r.name, r.path, level);
+            e.kind = Kind::Symlink;
+            e.stack.clear();
+            e.project = None;
+            e.repo = None;
+            e.main_repo = None;
+            e.target_kind = Some(match &r.target {
+                Some(t) if t.exists() => classify(t).as_str(),
+                _ => "missing",
+            });
+            e.target = r.target;
+            e.readable = true;
+            e.error = None;
+            e
+        } else {
+            entry(r.name, r.path, level)
+        }
+    });
+    probed.unwrap_or_else(|| {
+        let mut e = Entry::bare(name, path, level);
+        e.readable = false;
+        e.error = Some("timed out".into());
+        e
+    })
+}
+
+impl Entry {
+    /// A folder entry with nothing looked up.
+    fn bare(name: String, path: PathBuf, depth: u32) -> Entry {
+        Entry {
+            hidden: name.starts_with('.'),
+            name,
+            kind: Kind::Dir,
+            depth,
+            readable: true,
+            error: None,
+            modified_at: None,
+            repos_below: 0,
+            repos_below_truncated: false,
+            truncated: false,
+            children: Vec::new(),
+            git: None,
+            stack: Vec::new(),
+            project: None,
+            repo: None,
+            config_error: None,
+            main_repo: None,
+            target: None,
+            target_kind: None,
+            path,
+        }
+    }
+}
+
 /// An entry for the folder at `path` with its kind and the cheap details.
 pub fn entry(name: String, path: PathBuf, depth: u32) -> Entry {
     let mut e = Entry {
@@ -410,6 +534,7 @@ fn git_until(dir: &Path, args: &[&str], deadline: Option<Instant>) -> Result<Opt
     else {
         return Ok(None);
     };
+    crate::cancel::track(&child);
     // Read stdout on the side, so a big output can't block the child.
     let mut out = child.stdout.take();
     let reader = std::thread::spawn(move || {
@@ -422,12 +547,14 @@ fn git_until(dir: &Path, args: &[&str], deadline: Option<Instant>) -> Result<Opt
     loop {
         match child.try_wait() {
             Ok(Some(st)) => {
+                crate::cancel::untrack(&child);
                 let s = reader.join().unwrap_or_default();
                 return Ok(st.success().then(|| s.trim_end().to_string()));
             }
             Ok(None) if deadline.is_some_and(|d| Instant::now() >= d) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                crate::cancel::untrack(&child);
                 return Err(());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(2)),
@@ -528,6 +655,9 @@ fn count_below(dir: &Path, o: &Opts, budget: &mut usize, until: Instant) -> (usi
                 continue;
             }
             let p = e.path();
+            if special(&p) {
+                continue;
+            }
             if p.join(".git").exists() {
                 found += 1;
             } else {
@@ -599,7 +729,7 @@ pub fn list(root: &Path, o: &Opts) -> Tree {
                 }
                 continue;
             }
-            let raws = match read(&dir, o) {
+            let raws = match read_bounded(&dir, o) {
                 Ok(r) if parent.is_none() => {
                     tree.children_total = r.len();
                     r.into_iter().skip(o.offset).collect()
@@ -631,24 +761,7 @@ pub fn list(root: &Path, o: &Opts) -> Tree {
                 if o.follow_links && !visited.insert(r.path.clone()) {
                     continue; // already in this listing
                 }
-                let mut e = if r.link && !o.follow_links {
-                    let mut e = entry(r.name, r.path, level);
-                    e.kind = Kind::Symlink;
-                    e.stack.clear();
-                    e.project = None;
-                    e.repo = None;
-                    e.main_repo = None;
-                    e.target_kind = Some(match &r.target {
-                        Some(t) if t.exists() => classify(t).as_str(),
-                        _ => "missing",
-                    });
-                    e.target = r.target;
-                    e.readable = true;
-                    e.error = None;
-                    e
-                } else {
-                    entry(r.name, r.path, level)
-                };
+                let mut e = probe(r, level, o.follow_links);
                 // A link (followed) to a folder above the root: shown, not walked.
                 let loops = o.follow_links && root.starts_with(&e.path);
                 if e.kind == Kind::Dir && loops {
@@ -670,9 +783,12 @@ pub fn list(root: &Path, o: &Opts) -> Tree {
         }
         queue = next;
     }
-    // Folders at the last level: truncated when they have subfolders to show.
+    // Folders at the last level: truncated when they have subfolders to show (a special
+    // one, or one that doesn't answer in time, counts as having some).
     for i in queue.into_iter().flatten() {
-        arena[i].truncated = read(&arena[i].path, o).is_ok_and(|r| !r.is_empty());
+        arena[i].truncated = special(&arena[i].path)
+            || read_bounded(&arena[i].path, o).is_ok_and(|r| !r.is_empty())
+            || arena[i].error.as_deref() == Some("timed out");
     }
 
     tree.git_partial = fill_git(&mut arena, o);
@@ -686,10 +802,27 @@ pub fn list(root: &Path, o: &Opts) -> Tree {
             continue;
         }
         let loops = o.follow_links && root.starts_with(&arena[i].path);
-        let (n, cut) = if loops {
+        let (n, cut) = if loops || special(&arena[i].path) {
             (0, true)
         } else if arena[i].truncated && arena[i].readable {
-            count_below(&arena[i].path, o, &mut budget, until)
+            // On another thread, so a folder that blocks (a hanging mount, a cloud-storage
+            // folder) can't hold the listing past its time budget.
+            let (dir, oc, b) = (arena[i].path.clone(), o.clone(), budget);
+            let left = until.saturating_duration_since(Instant::now());
+            match with_timeout(left, move || {
+                let mut b = b;
+                let r = count_below(&dir, &oc, &mut b, until);
+                (r, b)
+            }) {
+                Some((r, b)) => {
+                    budget = b;
+                    r
+                }
+                None => {
+                    budget = 0;
+                    (0, true)
+                }
+            }
         } else {
             kids[i]
                 .iter()
@@ -748,7 +881,7 @@ pub fn repos_flat(root: &Path, o: &Opts, max_depth: Option<u32>) -> Tree {
             tree.truncated = true;
             break;
         }
-        let Ok(raws) = read(
+        let Ok(raws) = read_bounded(
             &dir,
             &Opts {
                 follow_links: false,
@@ -759,7 +892,7 @@ pub fn repos_flat(root: &Path, o: &Opts, max_depth: Option<u32>) -> Tree {
             continue;
         };
         for r in raws {
-            if r.link {
+            if r.link || special(&r.path) {
                 continue;
             }
             let level = depth + 1;
@@ -908,6 +1041,20 @@ pub fn branches(lasts: &[bool]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_probes_time_out_and_system_folders_are_special() {
+        assert_eq!(with_timeout(Duration::from_secs(1), || 7), Some(7));
+        let slow = with_timeout(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        assert!(slow.is_none());
+        #[cfg(unix)]
+        {
+            assert!(special(Path::new("/dev")) && special(Path::new("/Volumes")));
+            assert!(!special(Path::new("/usr")) && !special(Path::new("/dev/x")));
+        }
+    }
 
     fn opts(depth: u32, max: usize) -> Opts {
         Opts {

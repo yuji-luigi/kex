@@ -326,8 +326,8 @@ the project, since a union alone never forgets anything.
   without a terminal, as in 0.1); `--repos a,b` (folders next to this repo or in `DIR`);
   `--workspace <file>`; `--from <file|->`. `--project` (an unknown id makes a project with
   that id, except with `--from`), `--repo`, `--depth`, `--dry-run` (any mode), `--reset`
-  (unchanged). With `--json` it asks nothing: without one of those flags it's an error that
-  points to `kex browse --json` + `--from -`.
+  (unchanged). With `--json` and none of those flags it sets up this repo and asks its
+  project and name as prompts (as 0.1 did); several repos: `kex browse --json` + `--from -`.
   Terminal steps: (1) workspace file (`src/workspace.rs`, a `Format` trait; VS Code
   `*.code-workspace`, JSONC, paths relative to the file) found in the folder, the repo or its
   parent → "Use it?" → what it lists → "Init these N repos?" (no = the browser).
@@ -577,7 +577,7 @@ users are affected. They can rename one of the two binaries or use an alias. See
 | Extra | Why |
 |---|---|
 | **Parallel fetch** in `pull`/`status` (one thread per repo) | 3–5 repos fetch in the time of one |
-| **`--json` mode** on every command: NDJSON events on stdout, questions as `prompt` events answered on stdin (README "JSON mode") | gateways, agents and scripts can drive kex without parsing terminal text |
+| **`--json` mode** on every command: NDJSON events on stdout, questions as `prompt` events answered on stdin (README "JSON mode"), conforming to cli-events/1 (`kex manifest`, a `view` on every result) | gateways, agents and scripts can drive kex without parsing terminal text, and generic clients without kex-specific code |
 | **`--dry-run`** for `pull` and `push` | shows what would change, safe to try |
 | **Shell completions**: `kex completions zsh\|bash\|fish\|powershell` (`clap_complete`) | tab-completes commands and repo names |
 | **`NO_COLOR` / non-TTY plain output** | correct output in CI, pipes, old terminals |
@@ -651,8 +651,16 @@ Added after v0.1:
 
 - `--json` (global): one JSON event per line, every `inquire` question also available as a `prompt` event (`src/ui.rs`); `kex run` takes `input` / `stop` messages on stdin. Protocol version 1.
 - Releases (§8.5).
+- cli-events/1 (`spec/cli-events-1.md`, `docs/self-description.md`): `kex manifest` (generated
+  from clap + `src/manifest.rs`'s annotation table, with a drift test), `manifest_hash` in
+  `hello` (RFC 8785 + SHA-256), a generic `view` and `key` on every result event, message ids
+  for UI text (`src/view.rs`), `restates` on log lines, prompt `columns` / option rows,
+  actions with `effect` / `confirm`, `exit.tone`, feature `cli_events`. `kex init --json`
+  asks for this repo's project and name (`init_prompts`). Limits: `browse --max-entries` ≤
+  1,000, `output` lines cut at 16 KiB, `--from` ≤ 1 MiB. The CLI tests validate every `--json`
+  line against the schema.
 
-Not built yet: `--dry-run` outside `--from`, run logs, `kex doctor --prune`, `kex clone`, Homebrew tap, winget/Scoop.
+Not built yet: run logs, `kex doctor --prune`, `kex clone`, Homebrew tap, winget/Scoop.
 
 ### 8.5 Releases and self-update (built)
 

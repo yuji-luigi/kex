@@ -20,7 +20,10 @@ use serde_json::{Map, Value, json};
 use crate::config::{self, Config, Peer, PrimeBranch, Stage};
 use crate::registry::Registry;
 use crate::tree::{self, Kind};
-use crate::{git, project, ui, util};
+use crate::{git, project, ui, util, view};
+
+/// The largest `--from` request kex reads (cli-events §9: 1 MiB per line).
+pub const MAX_REQUEST: usize = 1024 * 1024;
 
 /// Project id → repo name → path.
 pub type Projects = BTreeMap<String, BTreeMap<String, PathBuf>>;
@@ -30,6 +33,8 @@ struct Problem {
     index: Option<usize>,
     field: Option<String>,
     message: String,
+    /// `{"msg", "params"}` when the message is a fixed template.
+    msg: Option<Value>,
 }
 
 #[derive(Default)]
@@ -41,24 +46,30 @@ impl Problems {
             index,
             field: field.map(String::from),
             message: message.into(),
+            msg: None,
+        });
+    }
+
+    /// A problem with a fixed message (`from.*`).
+    fn add_m(&mut self, index: Option<usize>, field: Option<&str>, id: &str, params: Value) {
+        let m = view::msg(id, params);
+        self.0.push(Problem {
+            index,
+            field: field.map(String::from),
+            message: m["text"].as_str().unwrap_or_default().to_string(),
+            msg: Some(m),
         });
     }
 
     fn json(&self) -> Vec<Value> {
-        self.0
-            .iter()
-            .map(|p| json!({ "message": p.message, "index": p.index, "field": p.field }))
-            .collect()
+        self.0.iter().map(Problem::json).collect()
     }
 
     /// Each problem as an `error` event (JSON) or a `kex: repos[i].field: …` line.
     fn report(&self) {
         for p in &self.0 {
             if ui::json() {
-                ui::emit(
-                    "error",
-                    json!({ "message": p.message, "index": p.index, "field": p.field }),
-                );
+                ui::emit("error", p.json());
             } else {
                 let at = match (p.index, p.field.as_deref()) {
                     (Some(i), Some(f)) => format!("repos[{i}].{f}: "),
@@ -69,6 +80,19 @@ impl Problems {
                 eprintln!("kex: {at}{}", p.message);
             }
         }
+    }
+}
+
+impl Problem {
+    fn json(&self) -> Value {
+        let mut v = json!({ "message": self.message, "index": self.index, "field": self.field });
+        if let Some(m) = &self.msg {
+            v["msg"] = m["msg"].clone();
+            if let Some(p) = m.get("params") {
+                v["params"] = p.clone();
+            }
+        }
+        v
     }
 }
 
@@ -95,21 +119,37 @@ struct Target {
 
 /// `--from <file|->`: read the request, then [`run`].
 pub fn from_source(source: &str, project_flag: Option<String>, dry_run: bool) -> Result<u8> {
-    let text = if source == "-" {
-        let mut s = String::new();
+    // Read at most one byte past the limit: enough to know it's too big.
+    let limit = MAX_REQUEST as u64 + 1;
+    let mut bytes = Vec::new();
+    if source == "-" {
         std::io::stdin()
-            .read_to_string(&mut s)
+            .take(limit)
+            .read_to_end(&mut bytes)
             .context("reading the repos from stdin")?;
-        s
     } else {
         let p = util::expand_tilde(source);
-        std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
-    };
+        std::fs::File::open(&p)
+            .and_then(|f| f.take(limit).read_to_end(&mut bytes))
+            .with_context(|| format!("reading {}", p.display()))?;
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.len() > MAX_REQUEST {
+        let mut problems = Problems::default();
+        problems.add_m(None, None, "from.too_big", json!({ "limit": MAX_REQUEST }));
+        problems.report();
+        return Ok(2);
+    }
     match serde_json::from_str::<Value>(&text) {
         Ok(v) => run(v, project_flag, dry_run, &[]),
         Err(e) => {
             let mut problems = Problems::default();
-            problems.add(None, None, format!("not valid JSON: {e}"));
+            problems.add_m(
+                None,
+                None,
+                "from.not_json",
+                json!({ "error": e.to_string() }),
+            );
             problems.report();
             Ok(2)
         }
@@ -132,37 +172,29 @@ pub fn run(
         Value::Object(o) => {
             for k in o.keys() {
                 if k != "project" && k != "repos" {
-                    problems.add(
-                        None,
-                        Some(k),
-                        format!("unknown field \"{k}\" (expected project, repos)"),
-                    );
+                    problems.add_m(None, Some(k), "from.unknown_field", json!({ "field": k }));
                 }
             }
             let repos = match o.get("repos") {
                 Some(Value::Array(a)) => a.clone(),
                 Some(_) => {
-                    problems.add(None, Some("repos"), "must be an array");
+                    problems.add_m(None, Some("repos"), "from.not_array", Value::Null);
                     Vec::new()
                 }
                 None => {
-                    problems.add(None, Some("repos"), "missing");
+                    problems.add_m(None, Some("repos"), "from.missing", Value::Null);
                     Vec::new()
                 }
             };
             (o.get("project").cloned(), repos)
         }
         _ => {
-            problems.add(
-                None,
-                None,
-                "expected an array of repos or an object {project, repos}",
-            );
+            problems.add_m(None, None, "from.bad_shape", Value::Null);
             (None, Vec::new())
         }
     };
     if raw_items.is_empty() && problems.0.is_empty() {
-        problems.add(None, Some("repos"), "no repos given");
+        problems.add_m(None, Some("repos"), "from.no_repos", Value::Null);
     }
 
     let mut items: Vec<Item> = Vec::new();
@@ -196,13 +228,11 @@ pub fn run(
         let Some(path) = &it.path else { continue };
         match (&it.existing, &target) {
             (Some(c), Some(t)) if c.project == t.id => skipped.push(skipped_json(it, path, c)),
-            (Some(c), _) => problems.add(
+            (Some(c), _) => problems.add_m(
                 Some(it.index),
                 Some("path"),
-                format!(
-                    "already a kex repo in project {} (as \"{}\"); kex doesn't move repos between projects",
-                    c.project, c.repo
-                ),
+                "from.other_project",
+                json!({ "project": c.project, "repo": c.repo }),
             ),
             (None, _) => todo.push(it),
         }
@@ -240,19 +270,21 @@ pub fn run(
     for (k, it) in todo.iter().enumerate() {
         let Some(id) = &it.repo_id else { continue };
         if used.contains(id) {
-            problems.add(
+            problems.add_m(
                 Some(it.index),
                 Some("repo_id"),
-                format!("{id} is already used by another repo"),
+                "from.repo_id_used",
+                json!({ "id": id }),
             );
         } else if let Some(j) = todo[..k]
             .iter()
             .find(|o| o.repo_id.as_deref() == Some(id.as_str()))
         {
-            problems.add(
+            problems.add_m(
                 Some(it.index),
                 Some("repo_id"),
-                format!("{id} is given twice (repos[{}] too)", j.index),
+                "from.repo_id_twice",
+                json!({ "id": id, "index": j.index }),
             );
         }
     }
@@ -306,18 +338,37 @@ pub fn run(
     let Some(target) = target.filter(|_| problems.0.is_empty()) else {
         problems.report();
         if dry_run {
+            let notes: Vec<Value> = problems
+                .0
+                .iter()
+                .map(|p| view::note("error", p.msg.clone().unwrap_or(json!(p.message))))
+                .collect();
             ui::event(
                 "plan",
-                json!({ "valid": false, "project": project_json, "repos": [], "skipped": skipped, "errors": problems.json() }),
+                json!({
+                    "valid": false, "project": project_json, "repos": [], "skipped": skipped,
+                    "errors": problems.json(),
+                    "key": "plan",
+                    "view": view::view("table", json!({
+                        "title": view::m("plan.title"), "tone": "danger",
+                        "summary": view::m("plan.invalid"),
+                        "columns": plan_columns(), "rows": [], "notes": notes,
+                    })),
+                }),
             );
         }
         return Ok(2);
     };
-    say!(
-        "{} {}{}",
-        util::bold("project"),
-        target.id,
-        if target.new { " (new)" } else { "" }
+    let result_key = if dry_run { "plan" } else { "added" };
+    ui::say_about(
+        result_key,
+        "info",
+        &format!(
+            "{} {}{}",
+            util::bold("project"),
+            target.id,
+            if target.new { " (new)" } else { "" }
+        ),
     );
 
     if dry_run {
@@ -336,10 +387,11 @@ pub fn run(
             })
             .collect();
         for (_, p) in &plans {
-            say!("would write {}:", util::tilde(&p.path));
-            say!("{}", serde_json::to_string_pretty(&p.config)?);
+            let about = |t: &str| ui::say_about("plan", "info", t);
+            about(&format!("would write {}:", util::tilde(&p.path)));
+            about(&serde_json::to_string_pretty(&p.config)?);
             if let Some(l) = &p.gitignore_line {
-                say!("and add {l} to {}", util::tilde(&p.gitignore));
+                about(&format!("and add {l} to {}", util::tilde(&p.gitignore)));
             }
         }
         // The same input with every id pinned: sent back as it is, the real run writes
@@ -371,9 +423,13 @@ pub fn run(
             },
             "repos": entries.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
         });
+        let view = plan_view(&target, &plans, &skipped, &request)?;
         ui::event(
             "plan",
-            json!({ "valid": true, "project": project_json, "repos": repos, "skipped": skipped, "errors": [], "request": request }),
+            json!({
+                "valid": true, "project": project_json, "repos": repos, "skipped": skipped,
+                "errors": [], "request": request, "key": "plan", "view": view,
+            }),
         );
         return Ok(0);
     }
@@ -387,14 +443,36 @@ pub fn run(
             .iter()
             .map(|(k, e)| {
                 let p = &plans[*k];
-                warn!("{} {}: {e}", util::red("✗"), p.config.repo);
+                ui::warn_about(
+                    "added",
+                    &format!("{} {}: {e}", util::red("✗"), p.config.repo),
+                );
                 json!({ "repo": p.config.repo, "path": lossy(&p.root), "message": e })
             })
             .collect();
-        warn!("nothing was written (all or nothing)");
+        ui::warn_about("added", "nothing was written (all or nothing)");
+        let rows: Vec<Value> = failed
+            .iter()
+            .map(|f| {
+                json!({
+                    "key": f["path"], "tone": "danger", "detail": f["message"],
+                    "cells": { "repo": f["repo"], "path": f["path"] },
+                    "badges": [view::badge("failed", "danger")],
+                })
+            })
+            .collect();
         ui::event(
             "added",
-            json!({ "project": target.id, "repos": [], "skipped": skipped, "failed": failed, "rolled_back": rolled_back }),
+            json!({
+                "project": target.id, "repos": [], "skipped": skipped, "failed": failed,
+                "rolled_back": rolled_back,
+                "key": "added",
+                "view": view::view("table", json!({
+                    "title": view::m("added.title"), "subtitle": target.id, "tone": "danger",
+                    "summary": view::m("added.failed"),
+                    "columns": added_columns(), "rows": rows,
+                })),
+            }),
         );
         return Ok(1);
     }
@@ -407,24 +485,59 @@ pub fn run(
             .iter()
             .map(|b| b.branch.as_str())
             .collect();
-        say!(
-            "{} {:<12} {} ({}, prime {})",
-            util::green("✓"),
-            p.config.repo,
-            util::tilde(&p.path),
-            p.config.repo_id,
-            primes.join(", ")
+        ui::say_about(
+            "added",
+            "win",
+            &format!(
+                "{} {:<12} {} ({}, prime {})",
+                util::green("✓"),
+                p.config.repo,
+                util::tilde(&p.path),
+                p.config.repo_id,
+                primes.join(", ")
+            ),
         );
     }
     reg.save()?;
     for sk in &skipped {
-        say!(
-            "  {} {:<12} already in {}",
-            util::dim("·"),
-            sk["repo"].as_str().unwrap_or_default(),
-            target.id
+        ui::say_about(
+            "added",
+            "info",
+            &format!(
+                "  {} {:<12} already in {}",
+                util::dim("·"),
+                sk["repo"].as_str().unwrap_or_default(),
+                target.id
+            ),
         );
     }
+    let mut rows: Vec<Value> = plans
+        .iter()
+        .map(|p| {
+            let primes: Vec<&str> = p
+                .config
+                .prime_branches
+                .iter()
+                .map(|b| b.branch.as_str())
+                .collect();
+            json!({ "key": lossy(&p.root), "cells": {
+                "repo": p.config.repo, "path": lossy(&p.root), "repo_id": p.config.repo_id,
+                "prime_branches": primes,
+            }})
+        })
+        .collect();
+    rows.extend(skipped.iter().map(skipped_row));
+    let n = plans.len();
+    let summary = match n {
+        0 => view::msg("added.nothing", json!({ "project": target.id })),
+        1 => view::msg("added.summary_one", json!({ "n": 1, "project": target.id })),
+        _ => view::msg("added.summary", json!({ "n": n, "project": target.id })),
+    };
+    let notes = if n > 0 {
+        json!([view::note("info", view::m("added.commit_hint"))])
+    } else {
+        json!([])
+    };
     ui::event(
         "added",
         json!({
@@ -432,12 +545,104 @@ pub fn run(
             "repos": plans.iter().map(added_json).collect::<Vec<_>>(),
             "skipped": skipped,
             "failed": [],
+            "key": "added",
+            "view": view::view("table", json!({
+                "title": view::m("added.title"), "subtitle": target.id, "tone": "ok",
+                "summary": summary, "columns": added_columns(), "rows": rows, "notes": notes,
+            })),
         }),
     );
     if !plans.is_empty() {
-        say!("Check the prime branches, then commit kex.json in each repo.");
+        ui::say_about(
+            "added",
+            "info",
+            "Check the prime branches, then commit kex.json in each repo.",
+        );
     }
     Ok(0)
+}
+
+fn added_columns() -> Value {
+    json!([
+        view::col("repo", "text"),
+        view::col("path", "path"),
+        view::col("repo_id", "code"),
+        view::col("prime_branches", "branch"),
+    ])
+}
+
+fn plan_columns() -> Value {
+    json!([
+        view::col("repo", "text"),
+        view::col("path", "path"),
+        view::col("repo_id", "code"),
+        view::col("gitignore", "code"),
+    ])
+}
+
+/// A `skipped` entry as a muted row with its note.
+fn skipped_row(sk: &Value) -> Value {
+    let mut r = json!({
+        "key": sk["path"], "tone": "muted",
+        "cells": { "repo": sk["repo"], "path": sk["path"] },
+        "badges": [view::badge("already_kex", "muted")],
+    });
+    if let Some(n) = sk.get("note") {
+        r["detail"] = n.clone();
+    }
+    r
+}
+
+/// The dry run's table, with the real run as its action (the request with ids pinned).
+fn plan_view(
+    t: &Target,
+    plans: &[(usize, Plan)],
+    skipped: &[Value],
+    request: &Value,
+) -> Result<Value> {
+    let mut rows = Vec::new();
+    for (_, p) in plans {
+        rows.push(json!({
+            "key": lossy(&p.root),
+            "cells": {
+                "repo": p.config.repo, "path": lossy(&p.root), "repo_id": p.config.repo_id,
+                "gitignore": p.gitignore_line,
+            },
+            "details": [
+                view::field("writes", json!(lossy(&p.path)), "path"),
+                view::field("config", json!(serde_json::to_string_pretty(&p.config)?), "code"),
+            ],
+        }));
+    }
+    rows.extend(skipped.iter().map(skipped_row));
+    let subtitle = if t.new {
+        view::msg("plan.new_project", json!({ "id": t.id }))
+    } else {
+        view::msg("plan.project", json!({ "id": t.id }))
+    };
+    let n = plans.len();
+    let mut actions = Vec::new();
+    if n > 0 {
+        let label_id = if n == 1 {
+            "plan.apply_one"
+        } else {
+            "plan.apply"
+        };
+        actions.push(json!({
+            "label": view::msg(label_id, json!({ "n": n })),
+            "tone": "ok",
+            "effect": "write",
+            "confirm": view::msg("plan.apply_confirm", json!({ "n": n, "project": t.id })),
+            "run": { "command": "init", "options": { "from": "-" }, "stdin": request },
+        }));
+    }
+    Ok(view::view(
+        "table",
+        json!({
+            "title": view::m("plan.title"), "subtitle": subtitle, "tone": "info",
+            "columns": plan_columns(), "rows": rows, "actions": actions,
+        }),
+    ))
 }
 
 /// An already set-up repo of the target project in `skipped`, with what the input asks for
@@ -502,7 +707,7 @@ fn optional_string(
         Some(Value::String(s)) if s.trim().is_empty() => None,
         Some(Value::String(s)) => Some(s.trim().to_string()),
         Some(_) => {
-            problems.add(Some(i), Some(key), "must be a string");
+            problems.add_m(Some(i), Some(key), "from.must_be_string", Value::Null);
             None
         }
     }
@@ -516,19 +721,16 @@ fn parse_item(
     problems: &mut Problems,
 ) -> Option<Item> {
     let Value::Object(o) = raw else {
-        problems.add(
-            Some(i),
-            None,
-            "must be an object {path, name?, description?}",
-        );
+        problems.add_m(Some(i), None, "from.not_object", Value::Null);
         return None;
     };
     for k in o.keys() {
         if !["path", "name", "description", "repo_id"].contains(&k.as_str()) {
-            problems.add(
+            problems.add_m(
                 Some(i),
                 Some(k),
-                format!("unknown field \"{k}\" (expected path, name, description, repo_id)"),
+                "from.unknown_repo_field",
+                json!({ "field": k }),
             );
         }
     }
@@ -541,20 +743,21 @@ fn parse_item(
     if let Some(id) = &repo_id
         && !valid_repo_id(id)
     {
-        problems.add(
+        problems.add_m(
             Some(i),
             Some("repo_id"),
-            format!("\"{id}\" isn't a repo id: r_ and 1 to 32 lowercase letters or digits"),
+            "from.bad_repo_id",
+            json!({ "id": id }),
         );
     }
     let raw_path = match o.get("path") {
         Some(Value::String(s)) if !s.trim().is_empty() => s.trim(),
         Some(_) => {
-            problems.add(Some(i), Some("path"), "must be a non-empty string");
+            problems.add_m(Some(i), Some("path"), "from.path_empty", Value::Null);
             return None;
         }
         None => {
-            problems.add(Some(i), Some("path"), "missing");
+            problems.add_m(Some(i), Some("path"), "from.missing", Value::Null);
             return None;
         }
     };
@@ -568,40 +771,43 @@ fn parse_item(
         existing: None,
         given,
     };
-    let mut bad = |m: String| problems.add(Some(i), Some("path"), m);
+    let mut bad_m = |id: &str, params: Value| problems.add_m(Some(i), Some("path"), id, params);
+    let shown = |p: &Path| p.display().to_string();
     if !it.given.exists() {
-        bad(format!("{} doesn't exist", it.given.display()));
+        bad_m("from.no_path", json!({ "path": shown(&it.given) }));
         return Some(it);
     }
     if !it.given.is_dir() {
-        bad(format!("{} isn't a folder", it.given.display()));
+        bad_m("from.not_folder", json!({ "path": shown(&it.given) }));
         return Some(it);
     }
     let real = util::canon(&it.given);
     if !real.join(".git").exists() {
-        bad(match git::root(&real) {
-            Ok(r) => format!(
-                "{} isn't the top folder of a git repo (that is {})",
-                real.display(),
-                util::canon(&r).display()
+        match git::root(&real) {
+            Ok(r) => bad_m(
+                "from.not_top",
+                json!({ "path": shown(&real), "top": shown(&util::canon(&r)) }),
             ),
-            Err(_) => format!("{} isn't a git repo", real.display()),
-        });
+            Err(_) => bad_m("from.not_git_repo", json!({ "path": shown(&real) })),
+        }
         return Some(it);
     }
     if let Some(j) = earlier.iter().find(|e| e.path.as_deref() == Some(&real)) {
-        bad(format!("the same repo as repos[{}]", j.index));
+        bad_m("from.same_repo", json!({ "index": j.index }));
         return Some(it);
     }
+    let mut bad = |m: String| problems.add(Some(i), Some("path"), m);
     match tree::classify(&real) {
         Kind::Worktree => {
             let main = git::main_checkout(&real)
                 .map(|m| format!(" ({})", m.display()))
                 .unwrap_or_default();
-            bad(format!(
-                "{} is a linked worktree; add its main checkout instead{main}",
-                real.display()
-            ));
+            problems.add_m(
+                Some(i),
+                Some("path"),
+                "from.worktree",
+                json!({ "path": shown(&real), "main": main }),
+            );
             return Some(it);
         }
         Kind::KexRepo => match config::config_path(&real).and_then(|p| match p {
@@ -697,13 +903,16 @@ fn resolve_project(
             return Some(joined(id));
         }
         let list: Vec<&str> = known.keys().map(String::as_str).collect();
-        problems.add(
+        let known = if list.is_empty() {
+            "none".to_string()
+        } else {
+            list.join(", ")
+        };
+        problems.add_m(
             None,
             Some("project"),
-            format!(
-                "unknown project \"{id}\" (kex knows: {}); use {{\"new\": \"<name>\"}} to create one",
-                if list.is_empty() { "none".to_string() } else { list.join(", ") }
-            ),
+            "from.unknown_project",
+            json!({ "id": id, "known": known }),
         );
         None
     };
@@ -731,10 +940,11 @@ fn resolve_project(
         }
         Some(Value::String(id)) => {
             if let Some(f) = flag.filter(|f| *f != id) {
-                problems.add(
+                problems.add_m(
                     None,
                     Some("project"),
-                    format!("\"{id}\" here but --project {f}; pass one"),
+                    "from.project_twice",
+                    json!({ "id": id, "flag": f }),
                 );
                 return None;
             }
@@ -742,10 +952,11 @@ fn resolve_project(
         }
         Some(Value::Object(o)) => {
             for k in o.keys().filter(|k| *k != "new" && *k != "id") {
-                problems.add(
+                problems.add_m(
                     None,
                     Some("project"),
-                    format!("unknown field \"{k}\" (expected new, id)"),
+                    "from.unknown_project_field",
+                    json!({ "field": k }),
                 );
             }
             // `{"new": "Shop", "id": "shop-k2m9qa"}`: the id a dry run planned.
@@ -753,14 +964,14 @@ fn resolve_project(
                 None | Some(Value::Null) => None,
                 Some(Value::String(id)) => Some(id.trim().to_string()),
                 Some(_) => {
-                    problems.add(None, Some("project"), "\"id\" must be a string");
+                    problems.add_m(None, Some("project"), "from.id_not_string", Value::Null);
                     return None;
                 }
             };
             let name = match o.get("new") {
                 Some(Value::String(n)) => n.trim(),
                 _ => {
-                    problems.add(None, Some("project"), "{\"new\": …} needs a non-empty name");
+                    problems.add_m(None, Some("project"), "from.new_needs_name", Value::Null);
                     return None;
                 }
             };
@@ -771,10 +982,11 @@ fn resolve_project(
             match pinned {
                 // `<slug of at most 40>-xxxxxx`, as kex makes them.
                 Some(id) if !util::valid_repo_name(&id) || id.len() > util::NAME_MAX + 7 => {
-                    problems.add(
+                    problems.add_m(
                         None,
                         Some("project"),
-                        format!("\"{id}\" isn't a project id: lowercase letters, digits and -"),
+                        "from.bad_project_id",
+                        json!({ "id": id }),
                     );
                     None
                 }
@@ -785,11 +997,7 @@ fn resolve_project(
             }
         }
         Some(_) => {
-            problems.add(
-                None,
-                Some("project"),
-                "must be a project id or {\"new\": \"<name>\"}",
-            );
+            problems.add_m(None, Some("project"), "from.bad_project", Value::Null);
             None
         }
     }
@@ -913,6 +1121,8 @@ fn register(reg: &mut Registry, p: &Plan) {
 /// during the writes undo everything written so far and return [`crate::ui::Cancelled`].
 fn apply(plans: &[Plan]) -> Result<Vec<(usize, String)>> {
     let guard = signals::Guard::install();
+    // In JSON mode the process-wide handler (crate::cancel) only flags the signal here.
+    let _cooperative = crate::cancel::Cooperative::enter();
     let pause = std::env::var("KEX_TEST_WRITE_PAUSE_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
@@ -1024,7 +1234,7 @@ mod signals {
             }
 
             pub fn hit(&self) -> bool {
-                HIT.load(Ordering::SeqCst)
+                HIT.load(Ordering::SeqCst) || crate::cancel::cancelled()
             }
         }
 
@@ -1046,7 +1256,7 @@ mod signals {
                 Guard
             }
             pub fn hit(&self) -> bool {
-                false
+                crate::cancel::cancelled()
             }
         }
     }

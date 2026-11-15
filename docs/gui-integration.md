@@ -5,13 +5,27 @@ like Sakabar's "New kex workspace" spell. It explains which kex calls to make, w
 back, and how to show it. The exact message types are in
 [json-protocol.md](json-protocol.md); this page says how to use them together.
 
+A client that would rather have no kex-specific screen at all can build the same flow from
+generic widgets: kex describes its commands in a manifest and every result as a generic view
+([cli-events/1](../spec/cli-events-1.md)); [self-description.md](self-description.md#7-setting-up-repos-with-generic-widgets)
+shows this flow in those terms. A kex whose `hello.features` has **`"cli_events"`** does this:
+every line conforms to cli-events/1 and carries a `view`, so the client can switch to generic
+rendering; without it (an older kex), use the kex-specific events below. Both are in the same
+stream, so a client can move over one screen at a time.
+
 ## The calls
 
 `kex browse <dir> --json` per folder, then one `kex init --from - --json` with the repos the
 user picked. Every call is short, asks nothing and can be retried, so it survives a dropped
 connection, and the client owns navigation and selection. (`kex init --json` without
-`--from` asks nothing either: it's an `error` pointing to these two calls. `kex add` is
+`--from` sets up only the repo it runs in, asking for its project and name as prompts (the
+`init_prompts` feature; older kex sent an `error` pointing to these two calls), see
+[json-protocol.md](json-protocol.md#setting-up-repos-kex-init-alias-kex-add). `kex add` is
 another name for `kex init`.)
+
+The examples on this page shorten long lines with `…`. They show a result's `key` and `view`
+(shortened) for the setup steps below, where a generic client draws them; elsewhere the
+cli-events fields (`key`, `view`, `msg`, `params`, `manifest_hash`, …) are left out.
 
 ## Recommended flow: "New workspace"
 
@@ -39,7 +53,7 @@ spawn  kex browse /Users/me/src/shop --depth 2 --json        (no stdin needed)
 ```
 
 ```
-← {"type":"hello","kex":"0.2.0","protocol":1,"features":["browse","from","dry_run","workspaces","pin_ids","paging","repos_only","no_git"]}
+← {"type":"hello","standard":"cli-events/1",…,"kex":"0.2.0","protocol":1,"features":["browse","from",…,"cli_events"]}
 ← {"type":"tree","root":"/Users/me/src/shop","parent":"/Users/me/src","kind":"dir","readable":true,"error":null,"depth":2,"max_entries":500,"count":6,"truncated":false,"offset":0,"children_total":5,"has_more":false,"next_offset":null,"git":true,"git_partial":false,"flat":false,"tree":[
     {"name":"admin","path":"/Users/me/src/shop/admin","kind":"kex_repo","depth":1,"hidden":false,"readable":true,"branch":"main","dirty":0,"remote":"git@github.com:acme/admin.git","remote_display":"github.com/acme/admin","last_commit_at":"2026-11-12T18:20:11+01:00","stack":["node"],"project":"shop-7f3kq2","repo":"admin"},
     {"name":"api","path":"/Users/me/src/shop/api","kind":"repo","depth":1,"hidden":false,"readable":true,"branch":"dev","dirty":2,"remote":"git@github.com:acme/api.git","remote_display":"github.com/acme/api","last_commit_at":"2026-11-13T09:02:40+01:00","stack":["node"]},
@@ -53,7 +67,7 @@ spawn  kex browse /Users/me/src/shop --depth 2 --json        (no stdin needed)
     {"path":"admin","resolved":"/Users/me/src/shop/admin","name":null,"exists":true,"kind":"kex_repo","project":"shop-7f3kq2","repo":"admin","default_name":"admin","duplicate_of":null},
     {"path":"../old","resolved":"/Users/me/src/old","name":null,"exists":false,"kind":null,"project":null,"repo":null,"default_name":"old","duplicate_of":null}],
     "counts":{"folders":4,"repos":3,"addable":2,"already_kex":1,"worktrees":0,"missing":1,"duplicates":0}}]}
-← {"type":"exit","code":0}
+← {"type":"exit","code":0,"tone":"ok"}
 ```
 
 (Each event is one line; wrapped here for reading.)
@@ -146,11 +160,11 @@ spawn  kex init --from - --dry-run --json       (cwd: any folder; stdin below, t
      {"path":"/Users/me/src/shop/api","name":"api-server","description":"Orders and payments API"},
      {"path":"/Users/me/src/shop/web","name":"Web"},
      {"path":"/Users/me/src/shop/admin"}]}
-← {"type":"hello","kex":"0.2.0","protocol":1,"features":["browse","from","dry_run","workspaces","pin_ids","paging","repos_only","no_git"]}
-← {"type":"error","message":"already a kex repo in project shop-7f3kq2 (as \"admin\"); kex doesn't move repos between projects","index":2,"field":"path"}
+← {"type":"hello","standard":"cli-events/1",…,"kex":"0.2.0","protocol":1,"features":["browse","from",…,"cli_events"]}
+← {"type":"error","message":"already a kex repo in project shop-7f3kq2 (as \"admin\"); kex doesn't move repos between projects","index":2,"field":"path","msg":"from.other_project","params":{"project":"shop-7f3kq2","repo":"admin"}}
 ← {"type":"error","message":"\"Web\" isn't a repo name: use lowercase letters, digits and -, starting with a letter or digit","index":1,"field":"name"}
-← {"type":"plan","valid":false,"project":{"id":"shop-k2m9qa","new":true,"name":"Shop"},"repos":[],"skipped":[],"errors":[{"message":"already a kex repo in project shop-7f3kq2 …","index":2,"field":"path"},{"message":"\"Web\" isn't a repo name: …","index":1,"field":"name"}]}
-← {"type":"exit","code":2}
+← {"type":"plan","valid":false,"project":{"id":"shop-k2m9qa","new":true,"name":"Shop"},"repos":[],"skipped":[],"errors":[{"message":"already a kex repo in project shop-7f3kq2 …","index":2,"field":"path"},{"message":"\"Web\" isn't a repo name: …","index":1,"field":"name"}],"key":"plan","view":{"kind":"table","tone":"danger","summary":{"text":"Can't set these up: see the errors","msg":"plan.invalid"},…}}
+← {"type":"exit","code":2,"tone":"error"}
 ```
 
 Every problem comes at once (one `error` per problem, and the same list in `plan.errors`).
@@ -161,15 +175,15 @@ Fixed (join `shop-7f3kq2`, name `web`):
      {"path":"/Users/me/src/shop/api","name":"api-server","description":"Orders and payments API"},
      {"path":"/Users/me/src/shop/web","name":"web"},
      {"path":"/Users/me/src/shop/admin"}]}
-← {"type":"hello","kex":"0.2.0","protocol":1,"features":["browse","from","dry_run","workspaces","pin_ids","paging","repos_only","no_git"]}
-← {"type":"log","level":"info","text":"project shop-7f3kq2"}
-← {"type":"log","level":"info","text":"would write /Users/me/src/shop/api/kex.json:"}
+← {"type":"hello","standard":"cli-events/1",…,"kex":"0.2.0","protocol":1,"features":["browse","from",…,"cli_events"]}
+← {"type":"log","level":"info","text":"project shop-7f3kq2","restates":"plan"}
+← {"type":"log","level":"info","text":"would write /Users/me/src/shop/api/kex.json:","restates":"plan"}
 ← … (one log per file, for a terminal reader)
 ← {"type":"plan","valid":true,"project":{"id":"shop-7f3kq2","new":false,"name":null},"repos":[
     {"index":0,"path":"/Users/me/src/shop/api","repo":"api-server","config_path":"/Users/me/src/shop/api/kex.json","config":{"$schema":"https://raw.githubusercontent.com/yuji-luigi/kex/main/schema/kex.schema.json","version":1,"project":"shop-7f3kq2","repo":"api-server","repo_id":"r_v6m5lx","description":"Orders and payments API","prime_branches":[{"branch":"dev","stage":"dev","description":"Integration branch"},{"branch":"main","stage":"production","description":"Live"}],"peers":[{"repo":"admin","remote":"git@github.com:acme/admin.git"}]},"gitignore":{"path":"/Users/me/src/shop/api/.gitignore","add":"kex.local.json"}},
     {"index":1,"path":"/Users/me/src/shop/web","repo":"web","config_path":"/Users/me/src/shop/web/kex.json","config":{…},"gitignore":{"path":"/Users/me/src/shop/web/.gitignore","add":"kex.local.json"}}],
-  "skipped":[{"index":2,"path":"/Users/me/src/shop/admin","folder":"admin","reason":"already_kex","in_project":true,"repo":"admin","project":"shop-7f3kq2"}],"errors":[]}
-← {"type":"exit","code":0}
+  "skipped":[{"index":2,"path":"/Users/me/src/shop/admin","folder":"admin","reason":"already_kex","in_project":true,"repo":"admin","project":"shop-7f3kq2"}],"errors":[],"key":"plan","view":{"kind":"table",…}}
+← {"type":"exit","code":0,"tone":"ok"}
 ```
 
 That's the "These files will be written" preview: `config_path` and `config` per repo, and
@@ -200,17 +214,17 @@ again.
 
 ```
 spawn  kex init --from - --json            (stdin: plan.request, then close it)
-← {"type":"hello","kex":"0.2.0","protocol":1,"features":["browse","from","dry_run","workspaces","pin_ids","paging","repos_only","no_git"]}
-← {"type":"log","level":"info","text":"project shop-7f3kq2"}
-← {"type":"log","level":"info","text":"✓ api-server   /Users/me/src/shop/api/kex.json (r_v6m5lx, prime dev, main)"}
-← {"type":"log","level":"info","text":"✓ web          /Users/me/src/shop/web/kex.json (r_q81ozd, prime main)"}
-← {"type":"log","level":"info","text":"  · admin        already in shop-7f3kq2"}
+← {"type":"hello","standard":"cli-events/1",…,"kex":"0.2.0","protocol":1,"features":["browse","from",…,"cli_events"]}
+← {"type":"log","level":"info","text":"project shop-7f3kq2","restates":"added"}
+← {"type":"log","level":"win","text":"✓ api-server   /Users/me/src/shop/api/kex.json (r_v6m5lx, prime dev, main)","restates":"added"}
+← {"type":"log","level":"win","text":"✓ web          /Users/me/src/shop/web/kex.json (r_q81ozd, prime main)","restates":"added"}
+← {"type":"log","level":"info","text":"  · admin        already in shop-7f3kq2","restates":"added"}
 ← {"type":"added","project":"shop-7f3kq2","repos":[
     {"repo":"api-server","repo_id":"r_v6m5lx","path":"/Users/me/src/shop/api","config":"/Users/me/src/shop/api/kex.json","prime_branches":[…],"peers":["admin"],"description":"Orders and payments API"},
     {"repo":"web","repo_id":"r_q81ozd","path":"/Users/me/src/shop/web","config":"/Users/me/src/shop/web/kex.json","prime_branches":[…],"peers":["admin","api-server"],"description":null}],
-  "skipped":[{"index":2,"path":"/Users/me/src/shop/admin","folder":"admin","reason":"already_kex","in_project":true,"repo":"admin","project":"shop-7f3kq2"}],"failed":[]}
-← {"type":"log","level":"info","text":"Check the prime branches, then commit kex.json in each repo."}
-← {"type":"exit","code":0}
+  "skipped":[{"index":2,"path":"/Users/me/src/shop/admin","folder":"admin","reason":"already_kex","in_project":true,"repo":"admin","project":"shop-7f3kq2"}],"failed":[],"key":"added","view":{"kind":"table",…}}
+← {"type":"log","level":"info","text":"Check the prime branches, then commit kex.json in each repo.","restates":"added"}
+← {"type":"exit","code":0,"tone":"ok"}
 ```
 
 Show `added` as the result ("Party formed: 2 repos", with `skipped` and `failed`), then

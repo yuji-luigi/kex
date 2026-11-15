@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::setup::{self, folder_name, lossy};
-use crate::{browse, config, git, ui, util, workspace};
+use crate::{browse, config, git, ui, util, view, workspace};
 
 pub struct Opts {
     pub dir: Option<PathBuf>,
@@ -38,6 +38,9 @@ pub fn run(o: Opts) -> Result<u8> {
         bail!("not a folder: {}", dir.display());
     }
     let ask = util::interactive() && !ui::json() && !o.yes;
+    // `kex init --json` with no way to choose repos: this repo, asking its project and name
+    // as prompts (as kex 0.1 did).
+    let json_ask = ui::json() && !o.yes && o.repos.is_none() && o.workspace.is_none();
     let here = git::root(&dir).ok().map(|p| util::canon(&p));
     // Siblings are looked for in the folder around this repo (or in DIR).
     let base = here
@@ -50,13 +53,12 @@ pub fn run(o: Opts) -> Result<u8> {
         && let Some(root) = &here
         && let Some(path) = config::config_path(root)?
     {
-        return reset(&path, o.repo, ask);
+        // JSON mode asks the new name as a prompt, like the other init questions.
+        return reset(&path, o.repo, ask || ui::json());
     }
 
     // `--yes` / `--repo`, and plain `kex init` without a terminal (as in kex 0.1): this repo.
-    let single = o.yes
-        || o.repo.is_some()
-        || (!ask && !ui::json() && o.repos.is_none() && o.workspace.is_none());
+    let single = o.yes || o.repo.is_some() || (!ask && o.repos.is_none() && o.workspace.is_none());
     // Kex repos whose projects can be joined: this one, and the ones seen on the way.
     let mut near: Vec<PathBuf> = here.iter().cloned().collect();
     let mut repos: Vec<Value> = if let Some(f) = &o.workspace {
@@ -86,10 +88,6 @@ pub fn run(o: Opts) -> Result<u8> {
             return Ok(0);
         }
         vec![json!({ "path": lossy(root), "name": o.repo })]
-    } else if !ask {
-        bail!(
-            "kex init --json asks nothing: list folders with `kex browse --json`, then send the repos with `kex init --json --from -` (or pass --yes or --repos)"
-        );
     } else {
         let mut dirs = workspace::search_dirs(&dir);
         if !dirs.contains(&base) {
@@ -128,7 +126,7 @@ pub fn run(o: Opts) -> Result<u8> {
             paths_and(&mut near, &paths);
             let nearby = setup::nearby(&near);
             let default = folder_name(Some(&base)).unwrap_or_else(|| "project".into());
-            if ask {
+            if ask || json_ask {
                 ask_project(&nearby, &default)?
             } else if nearby.len() == 1 {
                 json!(nearby.keys().next())
@@ -138,7 +136,7 @@ pub fn run(o: Opts) -> Result<u8> {
             }
         }
     };
-    if ask {
+    if ask || (json_ask && o.repo.is_none()) {
         let cwd = std::env::current_dir()?;
         let known = setup::known_projects(&near, &cwd);
         let taken: HashSet<&str> = project
@@ -146,7 +144,17 @@ pub fn run(o: Opts) -> Result<u8> {
             .and_then(|id| known.get(id))
             .map(|m| m.keys().map(String::as_str).collect())
             .unwrap_or_default();
-        ask_names(&mut repos, &taken)?;
+        if ask {
+            ask_names(&mut repos, &taken)?;
+        } else {
+            for r in repos.iter_mut() {
+                let path = PathBuf::from(r["path"].as_str().unwrap_or_default());
+                let n = ui::text_checked(name_question(&path), &setup::default_name(&path), |n| {
+                    setup::name_problem(n, &taken)
+                })?;
+                r["name"] = json!(n);
+            }
+        }
     }
     setup::run(
         json!({ "project": project, "repos": repos }),
@@ -174,7 +182,10 @@ fn reset(path: &Path, repo: Option<String>, ask: bool) -> Result<u8> {
             None => n,
         },
         None if ask => ui::text_checked(
-            "New repo name:",
+            ui::Q::new("init.reset_name", Value::Null)
+                .with("pattern", json!("^[a-z0-9][a-z0-9-]*$"))
+                .with("min_length", json!(1))
+                .with("max_length", json!(util::NAME_MAX)),
             &format!("{}-2", c.repo),
             util::repo_name_problem,
         )?,
@@ -230,12 +241,11 @@ fn offer_workspace(dirs: &[PathBuf], near: &mut Vec<PathBuf>) -> Result<Option<V
     let w = match loaded.len() {
         0 => return Ok(None),
         1 => {
-            let msg = format!(
-                "Found {} in {}. Use it?",
-                file_name(&loaded[0]),
-                dir(&loaded[0])
+            let q = ui::Q::new(
+                "init.found_workspace",
+                json!({ "file": file_name(&loaded[0]), "dir": dir(&loaded[0]) }),
             );
-            if !ui::confirm(&msg, true)? {
+            if !ui::confirm(q, true)? {
                 return Ok(None);
             }
             loaded.swap_remove(0)
@@ -257,8 +267,8 @@ fn offer_workspace(dirs: &[PathBuf], near: &mut Vec<PathBuf>) -> Result<Option<V
                     )
                 })
                 .collect();
-            opts.push(ui::Opt::new("skip", "Don't use a workspace file"));
-            let i = ui::select_one(&format!("Found {n} workspace files. Use which one?"), &opts)?;
+            opts.push(ui::Opt::fixed("skip", "init.no_workspace", Value::Null));
+            let i = ui::select_one(ui::Q::new("init.pick_workspace", json!({ "n": n })), &opts)?;
             if i == n {
                 return Ok(None);
             }
@@ -331,14 +341,23 @@ fn use_workspace(
         return Ok(Some(repos));
     }
     let names: Vec<&str> = repos.iter().filter_map(|r| r["name"].as_str()).collect();
-    let msg = match names.len() {
-        1 => format!("Init this repo as a kex workspace? {}", names[0]),
-        n => format!(
-            "Init these {n} repos as a kex workspace? {}",
-            names.join(", ")
+    let q = match names.len() {
+        1 => ui::Q::new("init.use_workspace_one", json!({ "names": names[0] })),
+        n => ui::Q::new(
+            "init.use_workspace",
+            json!({ "n": n, "names": names.join(", ") }),
         ),
     };
-    Ok((!ask || ui::confirm(&msg, true)?).then_some(repos))
+    Ok((!ask || ui::confirm(q, true)?).then_some(repos))
+}
+
+/// "Repo name for <folder>:", with the name rules for programs.
+fn name_question(path: &Path) -> ui::Q {
+    let folder = folder_name(Some(path)).unwrap_or_default();
+    ui::Q::new("init.repo_name", json!({ "folder": folder }))
+        .with("pattern", json!("^[a-z0-9][a-z0-9-]*$"))
+        .with("min_length", json!(1))
+        .with("max_length", json!(util::NAME_MAX))
 }
 
 /// Join a project next to the repos, or create one.
@@ -347,23 +366,33 @@ fn ask_project(nearby: &setup::Projects, default: &str) -> Result<Value> {
         .iter()
         .map(|(id, rs)| {
             let names: Vec<&str> = rs.keys().map(String::as_str).collect();
-            ui::Opt::new(id, format!("Join {id} ({})", names.join(", ")))
+            let params = json!({ "project": id, "repos": names.join(", ") });
+            ui::Opt::fixed(id, "init.join", params)
+                .data(json!({ "repos": names }))
+                .row(json!({ "cells": { "project": id, "repos": names } }))
         })
         .collect();
-    opts.push(ui::Opt::new("new", "Create a new project"));
+    let new = view::cell(Value::Null, None, Some(view::m("init.new_project")));
+    opts.push(
+        ui::Opt::fixed("new", "init.new_project", Value::Null)
+            .row(json!({ "cells": { "project": new, "repos": null } })),
+    );
     let i = if opts.len() == 1 {
         0
     } else {
-        ui::select_one("Project", &opts)?
+        let q = ui::Q::new("init.project", Value::Null).with(
+            "columns",
+            json!([view::col("project", "code"), view::col("repos", "text")]),
+        );
+        ui::select_one(q, &opts)?
     };
     if let Some(id) = nearby.keys().nth(i) {
         return Ok(json!(id));
     }
-    let name = ui::text_checked(
-        "New project name:",
-        &util::slug(default),
-        util::project_name_problem,
-    )?;
+    let q = ui::Q::new("init.new_project_name", Value::Null)
+        .with("min_length", json!(1))
+        .with("max_length", json!(util::NAME_MAX));
+    let name = ui::text_checked(q, &util::slug(default), util::project_name_problem)?;
     Ok(json!({ "new": name }))
 }
 
@@ -384,7 +413,7 @@ fn ask_names(repos: &mut [Value], taken: &HashSet<&str>) -> Result<()> {
             .all(|n| setup::name_problem(n, taken).is_none());
     if fine
         && ui::confirm(
-            &format!("Use these repo names? {}", defaults.join(", ")),
+            ui::Q::new("init.use_names", json!({ "names": defaults.join(", ") })),
             true,
         )?
     {
@@ -407,8 +436,7 @@ fn ask_names(repos: &mut [Value], taken: &HashSet<&str>) -> Result<()> {
             })
             .find(|n| problem(n).is_none())
             .unwrap_or_default();
-        let folder = folder_name(Some(&path(r))).unwrap_or_default();
-        let n = ui::text_checked(&format!("Repo name for {folder}:"), &suggest, problem)?;
+        let n = ui::text_checked(name_question(&path(r)), &suggest, problem)?;
         r["name"] = json!(n);
         names.push(n);
     }

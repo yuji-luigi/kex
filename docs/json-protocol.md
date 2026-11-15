@@ -14,6 +14,13 @@ questions as its own UI (buttons, checklists, forms) and answer them.
 - The protocol version is the `protocol` field of the first event (`hello`). Additions
   within version 1 are backwards compatible: new event types, new optional fields. **Ignore
   unknown event types and fields.**
+- **Generic clients:** kex is a [cli-events/1](../spec/cli-events-1.md) tool: a manifest of
+  its commands (`kex manifest --json`) and a generic `view` (with a `key`) on every result,
+  so a client can drive kex without code for its event types. When `hello.features` has
+  `"cli_events"`, every line conforms to cli-events/1; what kex adds for it (all optional
+  fields on the lines below: `key`, `view`, `msg`, `params`, `restates`, prompt `columns`,
+  …) is in [self-description.md](self-description.md). This page keeps the kex-specific
+  fields, which stay as they are.
 
 ## Lifecycle
 
@@ -29,7 +36,14 @@ spawn  kex <command> --json            (stdin, stdout piped)
   ← exit {code}                        always last; then the process exits with that code
 ```
 
-If kex fails before it can finish, it sends `error` (no `id`) and then `exit` with code 2.
+If kex fails before it can finish, it sends `error` (no `id`) and then `exit` with code 2
+(`kex pr check` without a usable `gh`: `error` with `msg` `gh.missing` / `gh.logged_out` and
+the install help in `detail`, then `exit` 3).
+
+**SIGINT / SIGTERM** (Ctrl-C / Ctrl-Break on Windows) end any command with `exit` 130, tone
+`cancelled`, also while a prompt is open: kex stops the programs it started first. While
+`kex init` writes configs it undoes what it wrote (a `log` "interrupted: nothing was
+written"); `kex run` stops its services (`stopping`, then `exited`). Nothing follows `exit`.
 
 Exit codes: `0` ok · `1` some repo failed (others may have worked) · `2` error (config,
 usage, network) · `3` a required tool is missing (e.g. `gh`) · `130` cancelled.
@@ -39,33 +53,55 @@ usage, network) · `3` a required tool is missing (e.g. `gh`) · `130` cancelled
 ```ts
 /** Every line kex writes to stdout. Switch on `type`. */
 type KexEvent =
-  | Hello | Log | ErrorEvent | Exit
+  | Hello | Log | ErrorEvent | Exit | ManifestEvent
   | ProjectEvent | Prompt
-  | PullEvent | StatusEvent | PrsEvent | MergedEvent | PushedEvent | AddedEvent
+  | PullEvent | StatusEvent | PrsEvent | PrEvent | MergedEvent | PushedEvent | AddedEvent
   | TreeEvent | WorkspacesEvent | PlanEvent
-  | StartedEvent | OutputEvent | ReadyEvent | ExitedEvent
+  | StartedEvent | OutputEvent | ReadyEvent | StoppingEvent | ExitedEvent
   | VersionEvent | UpdateAvailableEvent | UpdatedEvent;
 
 // ── Session ──────────────────────────────────────────────────────────────────
+
+/** Every result event (not hello, prompt, log, error, exit) also has `key` and `view`
+ *  (cli-events/1, docs/self-description.md §5). Left out of the types below. */
 
 interface Hello {
   type: "hello";
   kex: string;          // kex version, e.g. "0.2.0"
   protocol: 1;          // this document
+  standard: "cli-events/1";
+  tool: { name: "kex"; version: string };
+  manifest_version: 1;
+  manifest_hash: string;  // 16 hex characters; changes when `kex manifest` does
   /** What this kex can do. Stable strings, only ever added (never renamed or removed
    *  without a `protocol` bump). **Check for the feature you need instead of comparing
    *  versions.** Absent in kex releases before these existed: treat that as `[]`.
    *  "browse" (`kex browse`), "from" (`--from`), "dry_run", "workspaces" (workspace files),
    *  "pin_ids" (`repo_id` / `project.id` in `--from`), "paging" (`kex browse --offset`),
-   *  "repos_only" (`kex browse --repos-only`), "no_git" (`--no-git`, `--git-budget-ms`). */
+   *  "repos_only" (`kex browse --repos-only`), "no_git" (`--no-git`, `--git-budget-ms`),
+   *  "manifest" (`kex manifest`), "views" (`view` on results), "init_prompts" (`kex init
+   *  --json` asks for this repo's project and name), "cli_events" (every line conforms to
+   *  cli-events/1: switch to generic rendering). */
   features?: string[];
+}
+
+/** `kex manifest --json`: kex's commands, options, exit codes, event types and messages
+ *  (cli-events/1 §7). */
+interface ManifestEvent {
+  type: "manifest";
+  manifest: object;
 }
 
 /** Everything a person would read in the terminal, line by line or as a block. */
 interface Log {
   type: "log";
-  level: "info" | "warn";
+  /** "win": a ✓ line, "error": a ✗ line (older kex: info / warn only). Treat others as info. */
+  level: "info" | "warn" | "win" | "error";
   text: string;         // may contain "\n" (e.g. `gh pr view` output)
+  /** The key of a view this line repeats in words: hide it if you draw that view. */
+  restates?: string;
+  msg?: string;         // id of a fixed line, with its `params`
+  params?: Record<string, string | number | boolean | null>;
 }
 
 interface ErrorEvent {
@@ -79,11 +115,14 @@ interface ErrorEvent {
    *  `exit` 2. `null`/absent when the problem isn't about one repo or one key. */
   index?: number | null;
   field?: string | null;
+  msg?: string;         // id of a fixed message (`from.not_git_repo`, …), with its `params`
+  params?: Record<string, string | number | boolean | null>;
 }
 
 interface Exit {
   type: "exit";
   code: 0 | 1 | 2 | 3 | 130;
+  tone: "ok" | "partial" | "error" | "missing_tool" | "cancelled";
 }
 
 // ── Project ──────────────────────────────────────────────────────────────────
@@ -105,6 +144,16 @@ interface PromptBase {
   type: "prompt";
   id: string;           // "p1", "p2", … unique within this process
   message: string;      // the question, show it as the title
+  msg: string;          // its id (`run.pick`, …), with `params`
+  params?: Record<string, string | number | boolean | null>;
+  /** select / multiselect: the options as a table (each option's `view` is a row). */
+  columns?: { key: string; label: object; type?: string }[];
+  picks_from?: string;  // the options are the rows of the view with this key ("prs")
+  tone?: "danger";      // the answer does something hard to undo
+  expect?: string;      // typed confirmation: the person types exactly this
+  pattern?: string;     // text: what the answer must match
+  min_length?: number;
+  max_length?: number;
 }
 
 interface Option {
@@ -114,6 +163,10 @@ interface Option {
   /** Structured details behind the label, for building your own UI.
    *  Shape depends on the prompt; see "Prompt catalogue". */
   data?: Record<string, unknown>;
+  /** The same as a row of the prompt's `columns`: `{cells, badges?, tone?}`. */
+  view?: object;
+  msg?: string;         // id of a fixed label (`pr.merge`, …), with `params`
+  params?: Record<string, string | number | boolean | null>;
 }
 
 interface SelectPrompt extends PromptBase {
@@ -195,6 +248,15 @@ interface PullRequest {
   created_at: string;   // RFC 3339, UTC
   draft: boolean;
   production: boolean;  // base is protected / production: show a warning
+}
+
+/** `kex pr check`: one PR's detail (title, author, branches, link, state, description, files,
+ *  checks, from `gh pr view --json`) as a card, sent before its merge / diff / back question.
+ *  Everything is in its `view`. */
+interface PrEvent {
+  type: "pr";
+  repo: string;
+  number: number;
 }
 
 interface MergedEvent {
@@ -390,7 +452,7 @@ interface OutputEvent {
   type: "output";
   repo: string;
   stream: "stdout" | "stderr";
-  line: string;         // one line, without the newline
+  line: string;         // one line, without the newline; cut at 16 KiB (ends in "…")
 }
 
 /** The service's `ready` URL accepts connections. */
@@ -400,11 +462,18 @@ interface ReadyEvent {
   url: string;
 }
 
+/** kex is stopping the service (a `stop` line, or a signal to kex). `exited` follows. */
+interface StoppingEvent {
+  type: "stopping";
+  repo: string;
+}
+
 interface ExitedEvent {
   type: "exited";
   repo: string;
   code: number | null;  // null = killed by a signal
-  success: boolean;
+  success: boolean;     // as the process ended (a stopped service may be false; its view
+                        // says "exited", not "failed")
 }
 
 // ── Versions ─────────────────────────────────────────────────────────────────
@@ -475,8 +544,10 @@ type RunCommand =
   | { type: "stop" };
 ```
 
-Unknown or invalid messages get an `error` event (no `id`). Closing stdin does **not** stop
-the services. Send `stop`, or SIGINT / SIGTERM the kex process.
+Unknown or invalid messages get a `log` with `level: "error"` and a `msg` (`run.bad_line`,
+`run.unknown_message`, `run.input_needs_repo`, `run.no_service`); the run goes on. Closing
+stdin does **not** stop the services. Send `stop` (the run then ends with its own code, 0 when
+all went well), or SIGINT / SIGTERM the kex process (it ends 130, cancelled).
 
 ## Prompt catalogue
 
@@ -507,7 +578,7 @@ should show them as a field the user fills in, not answer them automatically.
 
 ### Setting up repos (`kex init`, alias `kex add`)
 
-With `--json`, `kex init` asks nothing. It sets up the repos named by one of:
+With `--json`, `kex init` sets up the repos named by one of these flags, asking nothing:
 
 | flag | repos |
 |---|---|
@@ -516,15 +587,31 @@ With `--json`, `kex init` asks nothing. It sets up the repos named by one of:
 | `--repos a,b` | these folders, next to the repo kex runs in (or in `DIR`), or absolute |
 | `--workspace <file>` | the git repos without a kex config that a workspace file lists |
 
-Without one of them it sends an `error` ("list folders with `kex browse --json`, then send
-the repos with `kex init --json --from -`") and exits 2. Every mode goes through the same
+Without one of them (a kex with the `"init_prompts"` feature) it sets up the repo kex runs in
+(or `DIR`), as `kex init` in kex 0.1 did, and asks:
+
+| message | kind | when | option `value` / answer | option `data` |
+|---|---|---|---|---|
+| `Project` | select | a kex project is found nearby (the repo's neighbours, the registry) and no `--project` | a project id (label `Join <id> (<repo names>)`), or `new` | `{ repos: string[] }` (none on `new`) |
+| `New project name:` | text | `new` was picked, or no project was found | 1–40 characters, one line; default: the folder around the repo | |
+| `Repo name for <folder>:` | text | no `--repo` | a repo name (limits below); default: slug of the folder | |
+
+An answer breaking the limits gets an `error` with the prompt's `id`, and the question
+stays open. Outside a git repo it is an `error` (exit 2); in a repo that already has a
+kex.json it says so and exits 0 (`--reset` gives it new ids: in JSON it asks `New repo
+name:` (`init.reset_name`) unless `--repo` is given). Then it writes like `--yes`
+(same checks, same writer, `added`). `--dry-run` asks the same questions and sends `plan`.
+Several repos at once: `--from`. (A kex without `"init_prompts"` sends an `error` pointing to
+`kex browse --json` + `kex init --json --from -` instead, and exits 2.)
+
+Every mode goes through the same
 checks and the same all-or-nothing writer as `--from`, reports problems the same way
 (`error` events with `index` / `field`, exit 2), takes `--dry-run`, and ends with `added`.
 The project, unless given: the one of the kex repo kex runs in; with `--yes` / `--repos` /
 `--workspace`, else the only project found next to the repos; else a new one. `--project
 <id>` with an id kex doesn't know makes a project with that id (not with `--from`, where
 `{"new": …, "id": …}` does that). The folder browser, the workspace-file question, the
-project choice and the name questions are terminal-only.
+project choice and the name questions for several repos are terminal-only.
 
 ### Setting up repos from a list (`--from`) and `kex browse`
 
@@ -533,13 +620,18 @@ For a GUI that browses on its own (a file manager), there are two calls that ask
 - `kex browse [DIR] --json [--depth N] [--max-entries N] [--offset N] [--hidden] [--all]
   [--repos-only|--flat] [--no-git] [--git-budget-ms N]`:
   sends one `tree` event and one `workspaces` event, then `exit` 0. Default depth 3, cap
-  500 entries (breadth first, so the shallow levels fill first). When the cap cuts DIR's
+  500 entries (breadth first, so the shallow levels fill first); `--max-entries` is at most
+  1,000 (more is an `error`, exit 2), which keeps the line under 1 MiB. When the cap cuts DIR's
   own list, `has_more` / `next_offset` say so; `--offset <next_offset>` lists the next page.
   Skipped unless `--all`: `node_modules`, `target`, `build`, `dist`, `Pods`, `vendor`.
   Dot-folders (`.git`, `.dart_tool`, …) only with `--hidden` (both flags for `.git`);
   inside repos nothing is listed anyway. **Symlinks are not followed**: a link to a folder (or a dangling
   link) is a `symlink` entry with `target` and `target_kind`; links to files are left out.
-  An unreadable folder stays in the list with `readable: false` and `error`. Git fields are
+  An unreadable folder stays in the list with `readable: false` and `error`; so does one that
+  doesn't answer within 1 s (a hanging mount: `error: "timed out"`). System folders (`/dev`,
+  `/proc`, `/sys`, `/System`, `/Volumes`, `/net`, `/Network`, `/cores`, macOS's autofs
+  `/home`) are listed but not looked into from their parent (`truncated: true`; list them on
+  their own to see inside), and the `repos_below` walks skip them. Git fields are
   read only for the repos in the listing (3 git commands each, 8 at a time, with
   `GIT_OPTIONAL_LOCKS=0`, so kex never takes a repo's index lock), within a time budget
   (`--git-budget-ms`, default 5000, 0 = none): a git command still running then is stopped,
@@ -584,6 +676,7 @@ For a GUI that browses on its own (a file manager), there are two calls that ask
   input. Without `project`: `--project`, else the project of the kex repo kex runs
   in, else a new project named after the folder around the first repo.
 
+  A request over 1 MiB is refused unread (`error`, `msg: "from.too_big"`, exit 2).
   Everything is checked **before anything is written**, and every problem is reported at
   once: one `error` event per problem with `index` and `field`, then `exit` 2. Checked:
   valid JSON and shape, unknown keys (`field` = the key), `path` exists, is a folder, is the
@@ -629,6 +722,9 @@ asked again; otherwise it is an `error` with `index`/`field`, exit 2.
 
 ## Rendering guide
 
+With `"cli_events"` in `hello.features`, draw each line's `view` instead (cli-events/1 §5);
+the hints below are for the kex-specific fields.
+
 - `select` → buttons or a single-choice list. Show `label` (monospace keeps its columns) or
   build your own row from `data`. Send `value`.
 - `multiselect` → checkboxes, pre-checked from `default`. Send the checked `value`s.
@@ -646,7 +742,10 @@ asked again; otherwise it is an `error` with `index`/`field`, exit 2.
 
 The lines below are what kex sends, but **key order is not significant**: kex may write an
 object's keys in a different order than shown (prompts, for example, come out as `type`,
-`message`, `options`, `data`, `id`, `kind`). Parse each line as JSON; never match on text.
+`message`, `options`, `data`, `id`, `kind`). Parse each line as JSON; never match on text. The
+cli-events fields (`standard`, `manifest_hash`, `key`, `view`, `msg`, `params`, `columns`,
+`tone`, …) are left out of these examples; [self-description.md](self-description.md) shows
+them.
 
 `kex pr check --json`:
 
@@ -665,9 +764,9 @@ object's keys in a different order than shown (prompts, for example, come out as
 ← {"type":"prompt","id":"p4","kind":"text","message":"Type `accept` to merge:","default":null}
 → {"id":"p4","answer":"accept"}
 ← {"type":"merged","repo":"api","number":12,"state":"MERGED"}
-← {"type":"log","level":"info","text":"✓ #12 merged into dev"}
+← {"type":"log","level":"win","text":"✓ #12 merged into dev","restates":"merged:api#12"}
 ← {"type":"prs","items":[]}
-← {"type":"log","level":"info","text":"no open PRs"}
+← {"type":"log","level":"info","text":"no open PRs","restates":"prs"}
 ← {"type":"exit","code":0}
 ```
 

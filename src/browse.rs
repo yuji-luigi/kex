@@ -16,12 +16,15 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::tree::{self, Entry, Kind, Tree};
 use crate::ui::{self, Cancelled};
-use crate::{util, workspace};
+use crate::{git, util, view, workspace};
 
 const TITLE: &str = "Init which repos?";
 
 /// Entries in one picker view: keeps each prompt well under 1 MiB.
 pub const PICKER_MAX_ENTRIES: usize = 200;
+
+/// The most entries `kex browse` lists in one line (cli-events §9: 1,000 nodes per tree line).
+pub const MAX_ENTRIES: usize = 1000;
 
 #[derive(Clone, PartialEq, Debug)]
 enum Action {
@@ -335,6 +338,210 @@ pub struct BrowseOpts {
     pub offset: usize,
 }
 
+/// The options of this `kex browse` call that aren't the defaults, for its `open` / `up` /
+/// `next` actions (the same listing, of another folder or page).
+fn same_options(o: &BrowseOpts) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    if let Some(d) = o.depth {
+        m.insert("depth".into(), json!(d));
+    }
+    if o.max_entries != 500 {
+        m.insert("max_entries".into(), json!(o.max_entries));
+    }
+    for (k, on) in [
+        ("repos_only", o.repos_only),
+        ("no_git", !o.git),
+        ("hidden", o.hidden),
+        ("all", o.all),
+    ] {
+        if on {
+            m.insert(k.into(), json!(true));
+        }
+    }
+    if o.git_budget_ms != 5000 {
+        m.insert("git_budget_ms".into(), json!(o.git_budget_ms));
+    }
+    m
+}
+
+fn browse_action(label: Value, mut options: serde_json::Map<String, Value>, dir: &Value) -> Value {
+    options.insert("dir".into(), dir.clone());
+    json!({ "label": label, "run": { "command": "browse", "options": options } })
+}
+
+/// One `BrowseEntry` (raw JSON) as a tree node.
+fn node(e: &Value, here: Option<&Path>) -> Value {
+    let s = |k: &str| e[k].as_str().unwrap_or_default();
+    let (path, name, kind) = (s("path"), s("name"), s("kind"));
+    let mut n = json!({ "key": path, "label": name, "value": path, "kind": kind });
+    let mut badges = Vec::new();
+    let mut cells = serde_json::Map::new();
+    if let Some(b) = e["branch"].as_str() {
+        cells.insert("branch".into(), json!(b));
+    }
+    if let Some(d) = e["dirty"].as_u64() {
+        cells.insert("changed".into(), view::count(d, "warn"));
+    }
+    if let Some(st) = e["stack"].as_array().filter(|a| !a.is_empty()) {
+        cells.insert("stack".into(), json!(st));
+    }
+    let item = || json!({ "path": path, "name": util::slug(name) });
+    match kind {
+        "repo" => {
+            n["selectable"] = json!(true);
+            n["item"] = item();
+            if here.is_some_and(|h| h == util::canon(Path::new(path))) {
+                n["checked"] = json!(true);
+            }
+        }
+        "kex_repo" => {
+            n["selectable"] = json!(false);
+            badges.push(match e["project"].as_str() {
+                Some(p) => view::badge_p("kex_project", json!({ "project": p }), "muted"),
+                None => view::badge("broken_config", "danger"),
+            });
+        }
+        "worktree" => {
+            n["selectable"] = json!(false);
+            badges.push(view::badge("worktree", "muted"));
+        }
+        "symlink" => {
+            let target = s("target");
+            let to_repo = s("target_kind") == "repo";
+            n["selectable"] = json!(to_repo);
+            if to_repo {
+                n["item"] = item();
+            } else {
+                n["tone"] = json!("muted");
+            }
+            n["detail"] = if s("target_kind") == "missing" {
+                view::msg("tree.link_missing", json!({ "target": target }))
+            } else {
+                view::msg("tree.link", json!({ "target": target }))
+            };
+        }
+        _ => {
+            let below = e["repos_below"].as_u64().unwrap_or(0);
+            if below > 0 {
+                let id = if below == 1 {
+                    "tree.repos_below_one"
+                } else {
+                    "tree.repos_below"
+                };
+                n["detail"] = view::msg(id, json!({ "n": below }));
+            }
+            if e["truncated"] == true {
+                n["more"] = json!(true);
+            }
+        }
+    }
+    if e["readable"] == false {
+        n["tone"] = json!("danger");
+        n["detail"] = json!(s("error"));
+    }
+    if !badges.is_empty() {
+        n["badges"] = json!(badges);
+    }
+    if !cells.is_empty() {
+        n["cells"] = Value::Object(cells);
+    }
+    if let Some(ch) = e["children"].as_array() {
+        n["children"] = json!(ch.iter().map(|c| node(c, here)).collect::<Vec<_>>());
+    }
+    n
+}
+
+/// The `tree` event's view: the listing as nodes, with `open`, `up` and `next`.
+fn tree_view(t: &Value, o: &BrowseOpts, here: Option<&Path>) -> Value {
+    let same = same_options(o);
+    let nodes: Vec<Value> = t["tree"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| node(e, here))
+        .collect();
+    let root = t["root"].as_str().unwrap_or_default();
+    let mut v = view::view(
+        "tree",
+        json!({
+            "root": { "label": util::tilde(Path::new(root)), "value": root },
+            "columns": [
+                view::col("branch", "branch"), view::col("changed", "count"),
+                view::col("stack", "badge"),
+            ],
+            "nodes": nodes,
+            "open": { "run": { "command": "browse", "options": same }, "option": "dir" },
+        }),
+    );
+    if !t["parent"].is_null() {
+        v["up"] = browse_action(view::m("tree.up"), same.clone(), &t["parent"]);
+    }
+    if let Some(n) = t["next_offset"].as_u64() {
+        let mut opts = same.clone();
+        opts.insert("offset".into(), json!(n));
+        v["next"] = browse_action(view::m("tree.next"), opts, &t["root"]);
+    }
+    if t["git_partial"] == true {
+        v["notes"] = json!([view::note("warn", view::m("tree.git_partial"))]);
+    }
+    v
+}
+
+/// The `workspaces` event's view: one card per file, with a dry-run action.
+fn workspaces_view(ws: &[Value]) -> Value {
+    let rows: Vec<Value> = ws
+        .iter()
+        .map(|w| {
+            let path = w["path"].as_str().unwrap_or_default();
+            if let Some(e) = w["error"].as_str() {
+                return json!({
+                    "key": path, "cells": { "file": path }, "tone": "danger", "detail": e,
+                });
+            }
+            let c = &w["counts"];
+            let addable = c["addable"].as_u64().unwrap_or(0);
+            let mut row = json!({
+                "key": path,
+                "cells": {
+                    "name": w["name"], "file": path, "addable": addable,
+                    "already_kex": c["already_kex"], "missing": c["missing"],
+                },
+            });
+            if addable > 0 {
+                let file = Path::new(path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                row["actions"] = json!([{
+                    "label": view::msg("workspaces.use", json!({ "n": addable })),
+                    "confirm": view::msg(
+                        "workspaces.use_confirm",
+                        json!({ "n": addable, "file": file }),
+                    ),
+                    "run": {
+                        "command": "init",
+                        "options": { "workspace": path, "dry_run": true },
+                    },
+                }]);
+            }
+            row
+        })
+        .collect();
+    view::view(
+        "cards",
+        json!({
+            "title": view::m("workspaces.title"),
+            "columns": [
+                view::col("name", "text"), view::col("file", "path"),
+                view::col("addable", "count"), view::col("already_kex", "count"),
+                view::col("missing", "count"),
+            ],
+            "rows": rows,
+            "empty": view::m("workspaces.empty"),
+        }),
+    )
+}
+
 /// `kex browse`: list a folder as a tree, and the workspace files around it. Asks nothing.
 pub fn command(o: BrowseOpts) -> Result<u8> {
     let dir = match &o.dir {
@@ -343,6 +550,9 @@ pub fn command(o: BrowseOpts) -> Result<u8> {
     };
     if !dir.is_dir() {
         bail!("not a folder: {}", dir.display());
+    }
+    if o.max_entries > MAX_ENTRIES {
+        bail!("--max-entries can be at most {MAX_ENTRIES}; page with --offset");
     }
     let opts = tree::Opts {
         depth: o.depth.unwrap_or(3).max(1),
@@ -373,8 +583,22 @@ pub fn command(o: BrowseOpts) -> Result<u8> {
         } else {
             Some(opts.depth)
         };
-        ui::emit("tree", t.json(depth, opts.max_entries));
-        ui::emit("workspaces", json!({ "workspaces": workspaces }));
+        let mut tree = t.json(depth, opts.max_entries);
+        let here = std::env::current_dir()
+            .ok()
+            .and_then(|d| git::root(&d).ok())
+            .map(|p| util::canon(&p));
+        tree["key"] = json!("tree");
+        tree["view"] = tree_view(&tree, &o, here.as_deref());
+        ui::emit("tree", tree);
+        ui::emit(
+            "workspaces",
+            json!({
+                "workspaces": workspaces,
+                "key": "workspaces",
+                "view": workspaces_view(&workspaces),
+            }),
+        );
         return Ok(0);
     }
     say!("{}", util::bold(util::tilde(&t.root)));

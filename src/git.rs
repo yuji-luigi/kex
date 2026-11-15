@@ -9,11 +9,7 @@ use crate::util;
 
 /// Run git in `dir` and return its trimmed stdout.
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
+    let out = crate::cancel::output(Command::new("git").args(args).current_dir(dir))
         .context("failed to run git (is it installed?)")?;
     if !out.status.success() {
         bail!(
@@ -27,14 +23,15 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// Run git in `dir`, only caring whether it succeeds.
 pub fn ok(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    crate::cancel::status(
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .is_ok_and(|s| s.success())
 }
 
 /// Top folder of the checkout containing `dir`.

@@ -32,7 +32,11 @@ impl Env {
     }
 
     fn kex(&self, dir: &Path, args: &[&str]) -> Output {
-        self.cmd(dir, args).output().unwrap()
+        let out = self.cmd(dir, args).output().unwrap();
+        if args.contains(&"--json") {
+            conform(&stdout(&out));
+        }
+        out
     }
 
     fn kex_ok(&self, dir: &Path, args: &[&str]) -> String {
@@ -97,11 +101,339 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-/// `--json` prints one event per line; every line must be JSON.
+/// `--json` prints one event per line; every line must be JSON, and the stream must conform
+/// to cli-events/1 ([`conform`]).
 fn events(text: &str) -> Vec<serde_json::Value> {
-    text.lines()
-        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+    conform(text)
+}
+
+// ── cli-events/1 conformance (spec/cli-events-1.md §13) ─────────────────────────────────
+
+/// The schema, compiled once.
+fn validator() -> &'static jsonschema::Validator {
+    static V: std::sync::OnceLock<jsonschema::Validator> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../spec/cli-events-1.schema.json")).unwrap();
+        jsonschema::validator_for(&schema).unwrap()
+    })
+}
+
+/// `kex manifest --json`, run once: (hello, manifest).
+fn manifest() -> &'static (serde_json::Value, serde_json::Value) {
+    static M: std::sync::OnceLock<(serde_json::Value, serde_json::Value)> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_kex"))
+            .args(["manifest", "--json"])
+            .current_dir(tmp.path())
+            .env("KEX_HOME", tmp.path().join("kexhome"))
+            .env("KEX_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        let lines: Vec<serde_json::Value> = stdout(&out)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        for l in &lines {
+            assert_valid(l);
+        }
+        let m = lines
+            .iter()
+            .find(|l| l["type"] == "manifest")
+            .expect("manifest line");
+        (lines[0].clone(), m["manifest"].clone())
+    })
+}
+
+fn assert_valid(line: &serde_json::Value) {
+    let errors: Vec<String> = validator()
+        .iter_errors(line)
+        .map(|e| format!("{} at {}", e, e.instance_path()))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "line breaks cli-events/1: {errors:#?}\n{line}"
+    );
+}
+
+/// RFC 8785 canonical JSON (keys sorted by UTF-16 units), as the manifest hash needs.
+fn canonical(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap(),
+                        canonical(&o[k.as_str()])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        serde_json::Value::Array(a) => {
+            format!(
+                "[{}]",
+                a.iter().map(canonical).collect::<Vec<_>>().join(",")
+            )
+        }
+        other => other.to_string(),
+    }
+}
+
+fn manifest_hash(m: &serde_json::Value) -> String {
+    use sha2::Digest;
+    let d = sha2::Sha256::digest(canonical(m).as_bytes());
+    d.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// `{name}` placeholders of a template.
+fn placeholders(t: &str) -> Vec<String> {
+    t.split('{')
+        .skip(1)
+        .filter_map(|s| s.split_once('}').map(|(n, _)| n.to_string()))
         .collect()
+}
+
+fn render(t: &str, params: &serde_json::Value) -> String {
+    let mut out = t.to_string();
+    // A `{…}` that names no param is literal text (as kex renders it).
+    for name in placeholders(t) {
+        if params.get(&name).is_none() {
+            continue;
+        }
+        let v = match &params[&name] {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        out = out.replacen(&format!("{{{name}}}"), &v, 1);
+    }
+    out
+}
+
+/// Every message id is in the manifest; its params are placeholders of the template; and
+/// the English next to it is the template filled in.
+fn check_messages(v: &serde_json::Value, messages: &serde_json::Value) {
+    match v {
+        serde_json::Value::Object(o) => {
+            if let Some(id) = o.get("msg").and_then(|m| m.as_str()) {
+                let t = messages[id]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("msg {id} isn't in the manifest's messages"));
+                let names = placeholders(t);
+                let params = o.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                if let Some(p) = params.as_object() {
+                    for k in p.keys() {
+                        assert!(names.contains(k), "{id}: param {k} isn't in \"{t}\"");
+                    }
+                }
+                let main = ["text", "message", "label"]
+                    .iter()
+                    .find_map(|k| o.get(*k).and_then(|x| x.as_str()));
+                if let Some(main) = main {
+                    assert_eq!(main, render(t, &params), "{id}: text isn't its template");
+                }
+            }
+            o.values().for_each(|x| check_messages(x, messages));
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| check_messages(x, messages)),
+        _ => {}
+    }
+}
+
+/// cli-events §5.4: a RunAction must name a command of the manifest that isn't
+/// needs_terminal, with valid options, stdin only for its JSON input (valid against its
+/// schema), no cwd, and a confirm unless it's read-only navigation.
+fn check_run(run: &serde_json::Value, action: Option<&serde_json::Value>, navigation: bool) {
+    let m = &manifest().1;
+    let id = run["command"].as_str().unwrap();
+    let cmd = m["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .unwrap_or_else(|| panic!("action runs unknown command {id}"));
+    assert_ne!(
+        cmd["needs_terminal"], true,
+        "action runs a terminal command"
+    );
+    assert!(run.get("cwd").is_none(), "kex never sets cwd: {run}");
+    let opts = cmd["options"].as_array().unwrap();
+    for (k, v) in run["options"].as_object().into_iter().flatten() {
+        let o = opts
+            .iter()
+            .find(|o| o["id"] == k.as_str())
+            .unwrap_or_else(|| panic!("{id} has no option {k}"));
+        let ok = match o["type"].as_str().unwrap() {
+            "boolean" => v.is_boolean(),
+            "integer" => v
+                .as_u64()
+                .is_some_and(|n| o["max"].as_u64().is_none_or(|max| n <= max)),
+            "list" => v.is_array() || v.is_string(),
+            _ => v.is_string(),
+        };
+        assert!(ok, "{id} --{k}: {v} isn't a {}", o["type"]);
+    }
+    if let Some(stdin) = run.get("stdin") {
+        let ji = &cmd["json_input"];
+        assert!(ji.is_object(), "{id} takes no stdin");
+        let opt = ji["option"].as_str().unwrap();
+        let stdin_value = opts.iter().find(|o| o["id"] == opt).unwrap()["stdin_value"].clone();
+        assert_eq!(run["options"][opt], stdin_value);
+        let v = jsonschema::validator_for(&ji["schema"]).unwrap();
+        let errors: Vec<String> = v.iter_errors(stdin).map(|e| e.to_string()).collect();
+        assert!(
+            errors.is_empty(),
+            "stdin breaks the input schema: {errors:?}\n{stdin}"
+        );
+        assert!(stdin.to_string().len() <= 1024 * 1024);
+    }
+    let read_only = cmd["read_only"] == true;
+    if !(navigation && read_only) {
+        let a = action.expect("a non-navigation RunAction is an action");
+        assert!(a.get("confirm").is_some(), "RunAction without confirm: {a}");
+    }
+}
+
+/// Every cell is under a column: a table's / cards' rows, a tree's nodes, a prompt's
+/// options (cli-events §5.1, §6).
+fn check_cells(v: &serde_json::Value) {
+    fn keys(columns: &serde_json::Value) -> Vec<String> {
+        columns
+            .as_array()
+            .map(|c| {
+                c.iter()
+                    .map(|c| c["key"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn cells_ok(cells: &serde_json::Value, cols: &[String], what: &str) {
+        for k in cells.as_object().into_iter().flatten().map(|(k, _)| k) {
+            assert!(
+                cols.contains(k),
+                "{what}: cell {k} has no column (columns: {cols:?})"
+            );
+        }
+    }
+    fn nodes(ns: &serde_json::Value, cols: &[String]) {
+        for n in ns.as_array().into_iter().flatten() {
+            if let Some(c) = n.get("cells") {
+                cells_ok(c, cols, "tree node");
+            }
+            nodes(&n["children"], cols);
+        }
+    }
+    match v {
+        serde_json::Value::Object(o) => {
+            let cols = keys(&v["columns"]);
+            let appending = v["mode"] == "append" && v.get("columns").is_none();
+            if !appending {
+                for r in v["rows"].as_array().into_iter().flatten() {
+                    cells_ok(&r["cells"], &cols, "row");
+                }
+            }
+            nodes(&v["nodes"], &cols);
+            if v["type"] == "prompt" {
+                for opt in v["options"].as_array().into_iter().flatten() {
+                    if let Some(c) = opt.get("view").map(|w| &w["cells"]) {
+                        assert!(
+                            !cols.is_empty(),
+                            "an option with a view in a prompt without columns"
+                        );
+                        cells_ok(c, &cols, "prompt option");
+                    }
+                }
+            }
+            o.values().for_each(check_cells);
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(check_cells),
+        _ => {}
+    }
+}
+
+fn check_actions(v: &serde_json::Value) {
+    match v {
+        serde_json::Value::Object(o) => {
+            for (k, x) in o {
+                match k.as_str() {
+                    "actions" => {
+                        for a in x.as_array().unwrap() {
+                            if let Some(run) = a.get("run") {
+                                check_run(run, Some(a), false);
+                            }
+                        }
+                    }
+                    "up" | "next" if x.get("run").is_some() => check_run(&x["run"], Some(x), true),
+                    "open" if x.get("option").is_some() => check_run(&x["run"], None, true),
+                    _ => {}
+                }
+                check_actions(x);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(check_actions),
+        _ => {}
+    }
+}
+
+/// Parse a `--json` stdout and check it against cli-events/1.
+fn conform(text: &str) -> Vec<serde_json::Value> {
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| {
+            assert!(l.len() <= 1024 * 1024, "line over 1 MiB");
+            serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}"))
+        })
+        .collect();
+    if lines.is_empty() {
+        return lines;
+    }
+    let (hello, m) = manifest();
+    let standard = [
+        "hello", "manifest", "prompt", "log", "error", "result", "exit", "answer",
+    ];
+    let types: Vec<&str> = m["event_types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(lines[0]["type"], "hello", "hello first");
+    assert_eq!(lines[0]["manifest_hash"], hello["manifest_hash"]);
+    assert_eq!(lines[0]["standard"], "cli-events/1");
+    for (i, l) in lines.iter().enumerate() {
+        assert_valid(l);
+        let t = l["type"].as_str().unwrap();
+        assert!(
+            standard.contains(&t) || types.contains(&t),
+            "{t} isn't in event_types"
+        );
+        assert!(i == 0 || t != "hello", "hello twice");
+        if t == "exit" {
+            assert_eq!(i, lines.len() - 1, "exit last");
+            let code = l["code"].as_u64().unwrap();
+            if let Some(e) = m["exit_codes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["code"] == code)
+            {
+                assert_eq!(l["tone"], e["tone"]);
+            }
+        }
+        check_messages(l, &m["messages"]);
+        check_actions(l);
+        check_cells(l);
+    }
+    assert_eq!(lines.last().unwrap()["type"], "exit", "exit last");
+    lines
 }
 
 fn status_json(env: &Env, dir: &Path) -> serde_json::Value {
@@ -507,32 +839,64 @@ fn init_repos_adds_folders_to_this_repos_project() {
 }
 
 #[test]
-fn init_json_asks_nothing() {
+fn init_json_asks_the_project_and_the_name_of_this_repo() {
     let env = Env::new();
     let api = env.repo("shop/api");
-    for cmd in ["init", "add"] {
-        let out = env
-            .cmd(&api, &[cmd, "--json"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(2));
-        let ev = events(&stdout(&out));
-        assert!(!ev.iter().any(|e| e["type"] == "prompt"));
-        let e = find_event(&ev, "error");
-        let m = e["message"].as_str().unwrap();
-        assert!(
-            m.contains("kex browse --json") && m.contains("--from -"),
-            "{m}"
-        );
-        assert_eq!(ev.last().unwrap()["code"], 2);
-    }
-    assert!(!api.join("kex.json").exists());
+    let web = env.repo("shop/web");
+
+    // No project around: straight to a new project's name, then the repo name. An answer
+    // breaking the rules is an error for that prompt, which stays open.
+    let input = "{\"type\":\"answer\",\"id\":\"p1\",\"answer\":\"Shop\"}\n\
+                 {\"type\":\"answer\",\"id\":\"p2\",\"answer\":\"Bad Name\"}\n\
+                 {\"type\":\"answer\",\"id\":\"p2\",\"answer\":\"backend\"}\n";
+    let (ev, code) = kex_stdin(&env, &api, &["init", "--json"], input);
+    assert_eq!(code, Some(0), "{ev:?}");
+    let prompts: Vec<&serde_json::Value> = ev.iter().filter(|e| e["type"] == "prompt").collect();
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert_eq!(prompts[0]["msg"], "init.new_project_name");
+    assert_eq!(prompts[1]["msg"], "init.repo_name");
+    assert_eq!(prompts[1]["message"], "Repo name for api:");
+    assert_eq!(prompts[1]["default"], "api");
+    assert_eq!(prompts[1]["pattern"], "^[a-z0-9][a-z0-9-]*$");
+    let rejected = ev
+        .iter()
+        .find(|e| e["type"] == "error" && e["id"] == "p2")
+        .expect("the bad name is an error for p2");
+    assert!(rejected["message"].as_str().unwrap().contains("repo name"));
+    let c = read_config(&api);
+    assert_eq!(c["repo"], "backend");
+    assert!(c["project"].as_str().unwrap().starts_with("shop-"));
+    let added = find_event(&ev, "added");
+    assert_eq!(added["view"]["kind"], "table");
+
+    // With a project next to it: "Project" (join it, or new), then the name (null = default).
+    let input = "{\"type\":\"answer\",\"id\":\"p1\",\"answer\":0}\n{\"type\":\"answer\",\"id\":\"p2\",\"answer\":null}\n";
+    let (ev, code) = kex_stdin(&env, &web, &["add", "--json"], input);
+    assert_eq!(code, Some(0), "{ev:?}");
+    let p1 = find_event(&ev, "prompt");
+    assert_eq!(p1["kind"], "select");
+    assert_eq!(p1["msg"], "init.project");
+    assert_eq!(p1["options"][0]["value"], c["project"]);
+    assert_eq!(
+        p1["options"][0]["data"]["repos"],
+        serde_json::json!(["backend"])
+    );
+    assert_eq!(p1["options"][1]["value"], "new");
+    assert!(p1["columns"].is_array());
+    assert_eq!(read_config(&web)["project"], c["project"]);
+    assert_eq!(read_config(&web)["repo"], "web");
+
+    // Already set up: says so, exit 0; outside a repo: an error.
+    let (ev, code) = kex_stdin(&env, &web, &["init", "--json"], "");
+    assert_eq!(code, Some(0));
+    assert!(!ev.iter().any(|e| e["type"] == "prompt"));
+    let (_, code) = kex_stdin(&env, env.root(), &["init", "--json"], "");
+    assert_eq!(code, Some(2));
 
     // Without a terminal (and not JSON), plain `kex init` sets up this repo, as in 0.1.
-    env.kex_ok(&api, &["init"]);
-    assert_eq!(read_config(&api)["repo"], "api");
-    // Outside a repo there's nothing to set up without picking.
+    let solo = env.repo("solo/one");
+    env.kex_ok(&solo, &["init"]);
+    assert_eq!(read_config(&solo)["repo"], "one");
     let out = env.kex(env.root(), &["init"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
@@ -689,12 +1053,8 @@ fn kex_stdin(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = c.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    // kex may stop reading early (a request over the limit): a broken pipe is fine.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
     let out = child.wait_with_output().unwrap();
     (events(&stdout(&out)), out.status.code())
 }
@@ -1479,4 +1839,589 @@ fn names_and_descriptions_have_length_limits() {
     env.kex_ok(&longdir, &["init", "--yes"]);
     assert_eq!(read_config(&longdir)["repo"], "b".repeat(40));
     assert!(!api.join("kex.json").exists());
+}
+
+// ── cli-events/1: docs, manifest, limits, the generic flow ──────────────────────────────
+
+/// Every example line in the standard and in kex's profile is valid cli-events/1.
+#[test]
+fn every_example_line_in_the_docs_validates() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut n = 0;
+    for doc in ["spec/cli-events-1.md", "docs/self-description.md"] {
+        let text = fs::read_to_string(root.join(doc)).unwrap();
+        for block in text.split("```ndjson\n").skip(1) {
+            let block = block.split("```").next().unwrap();
+            for line in block.lines() {
+                let line = line.trim().trim_start_matches(['←', '→']).trim();
+                if line.is_empty() || line.contains('…') {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("{doc}: not JSON ({e}): {line}"));
+                assert_valid(&v);
+                // kex's own examples also use kex's real messages and valid actions.
+                if doc.starts_with("docs/") && v["type"] != "manifest" {
+                    check_messages(&v, &manifest().1["messages"]);
+                    check_actions(&v);
+                }
+                check_cells(&v);
+                n += 1;
+            }
+        }
+    }
+    assert!(n >= 40, "only {n} example lines");
+}
+
+#[test]
+fn hello_carries_the_hash_of_the_manifest() {
+    let env = Env::new();
+    let api = env.repo("shop/api");
+    env.kex_ok(&api, &["init", "--yes"]);
+    let (hello, m) = manifest();
+    let hash = hello["manifest_hash"].as_str().unwrap();
+    assert_eq!(hash.len(), 16);
+    assert_eq!(hash, manifest_hash(m), "hash of the canonical manifest");
+    // Stable across runs and the same in every command's hello.
+    let again = events(&env.kex_ok(&api, &["manifest", "--json"]));
+    assert_eq!(again[0]["manifest_hash"], hash);
+    assert_eq!(
+        manifest_hash(&find_event(&again, "manifest")["manifest"]),
+        hash
+    );
+    let st = events(&env.kex_ok(&api, &["status", "--json"]));
+    assert_eq!(st[0]["manifest_hash"], hash);
+    assert!(
+        st[0]["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "cli_events")
+    );
+    // Commands and their annotations.
+    let cmd = |id: &str| -> serde_json::Value {
+        m["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no command {id}"))
+    };
+    assert_eq!(cmd("init")["aliases"], serde_json::json!([["add"]]));
+    assert_eq!(cmd("init")["json_input"]["option"], "from");
+    assert_eq!(cmd("browse")["read_only"], true);
+    assert_eq!(cmd("run")["stop"], serde_json::json!({"type": "stop"}));
+    assert_eq!(cmd("completions")["needs_terminal"], true);
+    assert_eq!(cmd("pr.check")["words"], serde_json::json!(["pr", "check"]));
+    assert!(
+        m["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["id"] != "help")
+    );
+    let update = cmd("update");
+    assert!(
+        !update["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["id"] == "quiet"),
+        "hidden options are left out"
+    );
+    // The manifest line is well under 512 KiB.
+    assert!(canonical(m).len() < 512 * 1024);
+    // The text form.
+    let text = env.kex_ok(&api, &["manifest"]);
+    assert!(text.contains(hash) && text.contains("init (add)"), "{text}");
+}
+
+#[test]
+fn completions_are_terminal_only() {
+    let env = Env::new();
+    // A usage error with --json is still a conforming stream.
+    let out = env.kex(env.root(), &["status", "--no-such-flag", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(find_event(&events(&stdout(&out)), "exit")["tone"], "error");
+    let out = env.kex(env.root(), &["completions", "zsh", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        env.kex_ok(env.root(), &["completions", "zsh"])
+            .contains("kex")
+    );
+}
+
+#[test]
+fn limits_keep_lines_small() {
+    let env = Env::new();
+    // 1,000 folders: one tree line, under 1 MiB (conform checks every line).
+    let big = env.root().join("big");
+    for i in 0..1000 {
+        fs::create_dir_all(big.join(format!("folder-with-a-longish-name-{i:04}"))).unwrap();
+    }
+    let out = env.kex(
+        &big,
+        &["browse", "--json", "--max-entries", "1000", "--depth", "1"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let tree = find_event(&events(&stdout(&out)), "tree").clone();
+    assert_eq!(tree["view"]["nodes"].as_array().unwrap().len(), 1000);
+    let out = env.kex(&big, &["browse", "--json", "--max-entries", "1001"]);
+    assert_eq!(out.status.code(), Some(2));
+
+    // A --from request over 1 MiB is refused before it's read as JSON.
+    let huge = format!("[{}]", vec!["{\"path\":\"x\"}"; 90_000].join(","));
+    assert!(huge.len() > 1024 * 1024);
+    let (ev, code) = kex_stdin(&env, env.root(), &["init", "--from", "-", "--json"], &huge);
+    assert_eq!(code, Some(2));
+    assert_eq!(find_event(&ev, "error")["msg"], "from.too_big");
+}
+
+/// argv for a RunAction, built only from the manifest (cli-events §7).
+fn argv_for(run: &serde_json::Value) -> Vec<String> {
+    let m = &manifest().1;
+    let cmd = m["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == run["command"])
+        .unwrap();
+    let mut argv: Vec<String> = cmd["words"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap().to_string())
+        .collect();
+    let mut positionals = Vec::new();
+    for o in cmd["options"].as_array().unwrap() {
+        let Some(v) = run["options"].get(o["id"].as_str().unwrap()) else {
+            continue;
+        };
+        let text = match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(a) => a
+                .iter()
+                .map(|x| x.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+                .join(o["separator"].as_str().unwrap_or(",")),
+            other => other.to_string(),
+        };
+        match (o["flag"].as_str(), o["type"].as_str()) {
+            (Some(f), Some("boolean")) => {
+                if v == true {
+                    argv.push(f.to_string());
+                }
+            }
+            (Some(f), _) => argv.push(format!("{f}={text}")),
+            (None, _) => positionals.push(text),
+        }
+    }
+    argv.push("--json".into());
+    if !positionals.is_empty() {
+        argv.push("--".into());
+        argv.extend(positionals);
+    }
+    argv
+}
+
+fn run_action(
+    env: &Env,
+    dir: &Path,
+    run: &serde_json::Value,
+) -> (Vec<serde_json::Value>, Option<i32>) {
+    let argv = argv_for(run);
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let stdin = run
+        .get("stdin")
+        .map(|s| format!("{s}\n"))
+        .unwrap_or_default();
+    kex_stdin(env, dir, &args, &stdin)
+}
+
+/// The generic flow of cli-events §8, with nothing kex-specific: browse → pick the items of
+/// selectable nodes → dry run → run the plan's action exactly as given → added.
+#[test]
+fn the_generic_setup_flow_works_from_the_views_alone() {
+    let env = Env::new();
+    let api = env.repo("shop/api");
+    env.repo("shop/web");
+    fs::create_dir_all(env.root().join("shop/docs")).unwrap();
+    let ji = &manifest().1["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "init")
+        .unwrap()["json_input"];
+    let picker = &ji["picker"];
+
+    // 1. Pick: the picker command, then the `open` of the view on the shop folder.
+    let mut run = serde_json::json!({ "command": picker["command"], "options": picker["options"] });
+    run["options"]["dir"] = serde_json::json!(lossy(&env.root().join("shop")));
+    let (ev, code) = run_action(&env, &api, &run);
+    assert_eq!(code, Some(0));
+    let view = &find_event(&ev, "tree")["view"];
+    assert_eq!(view["kind"], "tree");
+    let kinds: Vec<&str> = picker["select_kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    let items: Vec<serde_json::Value> = view["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["selectable"] == true && kinds.contains(&n["kind"].as_str().unwrap()))
+        .map(|n| n["item"].clone())
+        .collect();
+    assert_eq!(items.len(), 2, "api and web: {view}");
+    // The repo kex runs in starts checked.
+    assert!(
+        view["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["label"] == "api" && n["checked"] == true)
+    );
+
+    // 2. The document, into `picker.into`.
+    let mut doc = serde_json::json!({ "project": { "new": "Shop" } });
+    doc["repos"] = serde_json::json!(items);
+    assert_eq!(picker["into"], "/repos");
+
+    // 3. Review: a dry run.
+    let opt = ji["option"].as_str().unwrap();
+    let mut review = serde_json::json!({ "command": "init", "options": {}, "stdin": doc });
+    review["options"][opt] = serde_json::json!("-");
+    review["options"][ji["dry_run"].as_str().unwrap()] = serde_json::json!(true);
+    let (ev, code) = run_action(&env, env.root(), &review);
+    assert_eq!(code, Some(0), "{ev:?}");
+    let plan = &find_event(&ev, "plan")["view"];
+    assert_eq!(plan["rows"].as_array().unwrap().len(), 2);
+    assert!(!api.join("kex.json").exists(), "a dry run writes nothing");
+    let action = &plan["actions"][0];
+    assert_eq!(action["effect"], "write");
+
+    // 4. Run the action as given.
+    let (ev, code) = run_action(&env, env.root(), &action["run"]);
+    assert_eq!(code, Some(0), "{ev:?}");
+    let added = &find_event(&ev, "added")["view"];
+    assert_eq!(added["rows"].as_array().unwrap().len(), 2);
+    let planned_id = plan["rows"][0]["cells"]["repo_id"].clone();
+    assert!(
+        added["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["cells"]["repo_id"] == planned_id),
+        "the ids of the plan were written"
+    );
+}
+
+fn lossy(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+#[test]
+fn push_and_a_known_update_come_as_views() {
+    let env = Env::new();
+    let remote = env.root().join("remote/api.git");
+    fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "-q", "--bare"]);
+    let api = env.repo("shop/api");
+    git(&api, &["remote", "add", "origin", &lossy(&remote)]);
+    env.kex_ok(&api, &["init", "--yes"]);
+    commit(&api, "a.txt", "a");
+    let ev = events(&env.kex_ok(&api, &["push", "--repos", "api", "--yes", "--json"]));
+    let pushed = find_event(&ev, "pushed");
+    assert_eq!(pushed["ok"], true);
+    assert_eq!(pushed["key"], "push:api");
+    assert_eq!(pushed["view"]["lines"][0]["level"], "win");
+    assert_eq!(pushed["view"]["lines"][0]["text"]["msg"], "push.done");
+
+    // A newer release in the update cache: an `update_available` card with an Install
+    // action (checked against the manifest by `conform`), and the menu offers it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let home = env.root().join("kexhome");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("update.json"),
+        format!("{{\"checked_at\":{now},\"latest\":\"99.0.0\"}}"),
+    )
+    .unwrap();
+    let mut c = env.cmd(&api, &["status", "--json"]);
+    c.env_remove("KEX_NO_UPDATE_CHECK").env_remove("CI");
+    let out = c.output().unwrap();
+    let ev = events(&stdout(&out));
+    let up = find_event(&ev, "update_available");
+    let action = &up["view"]["actions"][0];
+    assert_eq!(action["effect"], "install");
+    assert_eq!(
+        action["run"],
+        serde_json::json!({"command": "update", "options": {"yes": true}})
+    );
+
+    let mut c = env.cmd(&api, &["--json"]);
+    c.env_remove("KEX_NO_UPDATE_CHECK")
+        .env_remove("CI")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"type\":\"answer\",\"id\":\"p1\",\"cancel\":true}\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(130));
+    let ev = events(&stdout(&out));
+    let menu = find_event(&ev, "prompt");
+    assert_eq!(menu["msg"], "menu.pick");
+    assert!(menu["columns"].is_array());
+    let last = menu["options"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["value"], "update");
+    assert_eq!(
+        last["view"]["cells"]["description"]["text"]["msg"],
+        "menu.update"
+    );
+    assert_eq!(ev.last().unwrap()["tone"], "cancelled");
+}
+
+#[test]
+#[should_panic(expected = "hello first")]
+fn conformance_checks_catch_a_stream_without_hello() {
+    conform("{\"type\":\"exit\",\"code\":0,\"tone\":\"ok\"}\n");
+}
+
+#[test]
+#[should_panic(expected = "breaks cli-events/1")]
+fn conformance_checks_catch_a_tool_line_without_a_view() {
+    let hash = manifest().0["manifest_hash"].as_str().unwrap().to_string();
+    conform(&format!(
+        "{{\"type\":\"hello\",\"standard\":\"cli-events/1\",\"tool\":{{\"name\":\"kex\",\"version\":\"0\"}},\"manifest_version\":1,\"manifest_hash\":\"{hash}\"}}\n{{\"type\":\"pull\",\"repo\":\"api\"}}\n{{\"type\":\"exit\",\"code\":0,\"tone\":\"ok\"}}\n"
+    ));
+}
+
+// ── Review 4: signals, stop, gh, manifest, reset, big trees ─────────────────────────────
+
+/// A `kex … --json` child whose stdout is read line by line.
+struct Live {
+    child: std::process::Child,
+    lines: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+    seen: Vec<String>,
+}
+
+impl Live {
+    fn start(env: &Env, dir: &Path, args: &[&str]) -> Live {
+        let mut c = env.cmd(dir, args);
+        c.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = c.spawn().unwrap();
+        let out = child.stdout.take().unwrap();
+        use std::io::BufRead;
+        Live {
+            child,
+            lines: std::io::BufReader::new(out).lines(),
+            seen: Vec::new(),
+        }
+    }
+
+    /// Read until a line matches.
+    fn until(&mut self, f: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        for l in self.lines.by_ref() {
+            let l = l.unwrap();
+            self.seen.push(l.clone());
+            let v: serde_json::Value = serde_json::from_str(&l).unwrap();
+            if f(&v) {
+                return v;
+            }
+        }
+        panic!("stream ended before the line: {:#?}", self.seen);
+    }
+
+    fn send(&mut self, line: &str) {
+        let s = self.child.stdin.as_mut().unwrap();
+        writeln!(s, "{line}").unwrap();
+        s.flush().unwrap();
+    }
+
+    /// The rest of the stream (checked by `conform`) and the exit code.
+    fn finish(mut self) -> (Vec<serde_json::Value>, Option<i32>) {
+        for l in self.lines.by_ref() {
+            self.seen.push(l.unwrap());
+        }
+        let code = self.child.wait().unwrap().code();
+        let text = self.seen.join("\n") + "\n";
+        (conform(&text), code)
+    }
+}
+
+#[cfg(unix)]
+fn sigint(child: &std::process::Child) {
+    // SAFETY: kill(2) on our own child.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+}
+
+/// A project with one repo whose service runs until stopped.
+fn sleeping_service(env: &Env) -> PathBuf {
+    let api = env.repo("p/api");
+    env.kex_ok(&api, &["init", "--yes", "--repo", "api"]);
+    let mut c = read_config(&api);
+    c["run"] = serde_json::json!({ "dev": "sleep 30" });
+    fs::write(api.join("kex.json"), c.to_string()).unwrap();
+    api
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_with_a_prompt_open_ends_cancelled() {
+    let env = Env::new();
+    let api = env.repo("shop/api");
+    env.kex_ok(&api, &["init", "--yes"]);
+    let mut live = Live::start(&env, &api, &["push", "--json"]);
+    live.until(|v| v["type"] == "prompt");
+    sigint(&live.child);
+    let (ev, code) = live.finish();
+    assert_eq!(code, Some(130));
+    assert_eq!(ev.last().unwrap()["tone"], "cancelled");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_during_run_stops_the_services_and_ends_cancelled() {
+    let env = Env::new();
+    let api = sleeping_service(&env);
+    let mut live = Live::start(&env, &api, &["run", "--json", "--no-update"]);
+    live.until(|v| v["type"] == "started");
+    sigint(&live.child);
+    let (ev, code) = live.finish();
+    assert_eq!(code, Some(130));
+    let stopping = find_event(&ev, "stopping");
+    assert_eq!(stopping["view"]["state"], "stopping");
+    let exited = find_event(&ev, "exited");
+    assert_eq!(exited["view"]["state"], "exited");
+    assert_eq!(exited["view"]["tone"], "muted");
+    assert_eq!(ev.last().unwrap()["tone"], "cancelled");
+}
+
+#[test]
+fn the_stop_line_ends_run_ok_and_bad_lines_are_logged() {
+    let env = Env::new();
+    let api = sleeping_service(&env);
+    let mut live = Live::start(&env, &api, &["run", "--json", "--no-update"]);
+    let started = live.until(|v| v["type"] == "started");
+    assert_eq!(started["view"]["state"], "running", "no URL to wait for");
+    live.send("{\"type\":\"bogus\"}");
+    let bad = live.until(|v| v["type"] == "log" && v["level"] == "error");
+    assert_eq!(bad["msg"], "run.unknown_message");
+    live.send("{\"type\":\"stop\"}");
+    let (ev, code) = live.finish();
+    assert_eq!(code, Some(0));
+    assert!(
+        !ev.iter().any(|e| e["type"] == "error"),
+        "no fatal-looking error"
+    );
+    let exited = find_event(&ev, "exited");
+    assert_eq!(exited["view"]["state"], "exited");
+    assert_eq!(exited["view"]["tone"], "muted");
+    assert!(exited["success"].is_boolean(), "kex-json field kept");
+    assert_eq!(ev.last().unwrap()["tone"], "ok");
+}
+
+#[cfg(unix)]
+#[test]
+fn pr_check_without_gh_is_an_error_then_exit_3() {
+    let env = Env::new();
+    let api = repo_with_remote(&env, "shop/api");
+    env.kex_ok(&api, &["init", "--yes"]);
+    // A PATH with git and nothing else.
+    let bin = env.root().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let git_path = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(git_path.trim(), bin.join("git")).unwrap();
+    let out = env
+        .cmd(&api, &["pr", "check", "--json"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let ev = events(&stdout(&out));
+    let e = find_event(&ev, "error");
+    assert_eq!(e["msg"], "gh.missing");
+    assert!(e.get("id").is_none());
+    assert_eq!(ev.last().unwrap()["tone"], "missing_tool");
+}
+
+#[test]
+fn manifest_sends_exactly_three_lines_even_with_an_update_known() {
+    let env = Env::new();
+    let home = env.root().join("kexhome");
+    fs::create_dir_all(&home).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    fs::write(
+        home.join("update.json"),
+        format!("{{\"checked_at\":{now},\"latest\":\"99.0.0\"}}"),
+    )
+    .unwrap();
+    let mut c = env.cmd(env.root(), &["manifest", "--json"]);
+    c.env_remove("KEX_NO_UPDATE_CHECK").env_remove("CI");
+    let ev = events(&stdout(&c.output().unwrap()));
+    let types: Vec<&str> = ev.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["hello", "manifest", "exit"]);
+}
+
+#[test]
+fn init_reset_asks_the_new_name_in_json() {
+    let env = Env::new();
+    let api = env.repo("shop/api");
+    env.kex_ok(&api, &["init", "--yes"]);
+    let before = read_config(&api);
+    let input = "{\"type\":\"answer\",\"id\":\"p1\",\"answer\":\"Bad Name\"}\n{\"type\":\"answer\",\"id\":\"p1\",\"answer\":\"api-copy\"}\n";
+    let (ev, code) = kex_stdin(&env, &api, &["init", "--reset", "--json"], input);
+    assert_eq!(code, Some(0), "{ev:?}");
+    let p = find_event(&ev, "prompt");
+    assert_eq!(p["msg"], "init.reset_name");
+    assert_eq!(p["pattern"], "^[a-z0-9][a-z0-9-]*$");
+    assert!(ev.iter().any(|e| e["type"] == "error" && e["id"] == "p1"));
+    let after = read_config(&api);
+    assert_eq!(after["repo"], "api-copy");
+    assert_ne!(after["repo_id"], before["repo_id"]);
+}
+
+#[test]
+fn browse_returns_promptly_on_a_big_deep_tree() {
+    let env = Env::new();
+    let big = env.root().join("big");
+    // 6,000 folders below one: more than one folder's walk may visit (5,000).
+    for i in 0..60 {
+        for j in 0..100 {
+            fs::create_dir_all(big.join(format!("deep/a{i}/b{j}"))).unwrap();
+        }
+    }
+    let start = std::time::Instant::now();
+    let out = env.kex(&big, &["browse", "--json", "--depth", "1", "--no-git"]);
+    assert!(out.status.success());
+    assert!(start.elapsed() < std::time::Duration::from_secs(15));
+    let tree = find_event(&events(&stdout(&out)), "tree").clone();
+    let deep = &tree["tree"][0];
+    assert_eq!(deep["name"], "deep");
+    assert_eq!(deep["repos_below_truncated"], true, "{deep}");
 }

@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use anyhow::{Result, bail};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 pub const PROTOCOL: u32 = 1;
 
@@ -24,6 +24,10 @@ pub const FEATURES: &[&str] = &[
     "paging",
     "repos_only",
     "no_git",
+    "manifest",
+    "views",
+    "init_prompts",
+    "cli_events",
 ];
 
 static JSON: AtomicBool = AtomicBool::new(false);
@@ -48,13 +52,22 @@ impl std::fmt::Display for Cancelled {
 }
 impl std::error::Error for Cancelled {}
 
-/// Write one event line. `kind` becomes the `type` field.
+/// Set once `exit` is written: nothing may follow it (cli-events/1 §3).
+static CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Write one event line. `kind` becomes the `type` field. After `exit`, nothing is written.
 pub fn emit(kind: &str, fields: Value) {
     let mut v = json!({ "type": kind });
     if let (Some(o), Value::Object(f)) = (v.as_object_mut(), fields) {
         o.extend(f);
     }
     let mut out = std::io::stdout().lock();
+    if CLOSED.load(Ordering::SeqCst) {
+        return;
+    }
+    if kind == "exit" {
+        CLOSED.store(true, Ordering::SeqCst);
+    }
     let _ = writeln!(out, "{v}");
     let _ = out.flush();
 }
@@ -97,6 +110,37 @@ pub fn say(text: &str) {
     }
 }
 
+/// A ✓ line: level `win` in JSON mode.
+pub fn say_win(text: &str) {
+    if json() {
+        emit("log", json!({ "level": "win", "text": strip_ansi(text) }));
+    } else {
+        println!("{text}");
+    }
+}
+
+/// A line that says in words what the view with `key` shows (`restates`). `level`: info,
+/// warn, error or win. In the terminal it goes to stdout, like [`say`].
+pub fn say_about(key: &str, level: &str, text: &str) {
+    if json() {
+        emit(
+            "log",
+            json!({ "level": level, "text": strip_ansi(text), "restates": key }),
+        );
+    } else {
+        println!("{text}");
+    }
+}
+
+/// [`say_about`] for a warning: in the terminal it goes to stderr, like [`warn`].
+pub fn warn_about(key: &str, text: &str) {
+    if json() {
+        say_about(key, "warn", text);
+    } else {
+        eprintln!("{text}");
+    }
+}
+
 pub fn warn(text: &str) {
     if json() {
         emit("log", json!({ "level": "warn", "text": strip_ansi(text) }));
@@ -123,12 +167,48 @@ pub fn child_stdout() -> Stdio {
     }
 }
 
+/// A question: its message (`{"text", "msg", "params"}`, from [`crate::view::msg`]) and
+/// what else the prompt carries for programs (`columns`, `expect`, `tone`, `pattern`, …).
+pub struct Q {
+    msg: Value,
+    extra: Map<String, Value>,
+}
+
+impl Q {
+    pub fn new(id: &str, params: Value) -> Self {
+        Q {
+            msg: crate::view::msg(id, params),
+            extra: Map::new(),
+        }
+    }
+    pub fn with(mut self, key: &str, v: Value) -> Self {
+        self.extra.insert(key.into(), v);
+        self
+    }
+    pub fn text(&self) -> String {
+        self.msg["text"].as_str().unwrap_or_default().to_string()
+    }
+    /// The prompt's fields: `message`, `msg`, `params`, the extras.
+    fn fields(&self) -> Value {
+        let mut f = self.extra.clone();
+        f.insert("message".into(), json!(self.text()));
+        f.insert("msg".into(), self.msg["msg"].clone());
+        if let Some(p) = self.msg.get("params") {
+            f.insert("params".into(), p.clone());
+        }
+        Value::Object(f)
+    }
+}
+
 /// One choice in a list. `value` is a stable id a program can answer with; `data` carries
-/// the structured details behind the label.
+/// the structured details behind the label, `row` the same as a row of the prompt's
+/// `columns`, `msg` the id of a fixed label.
 pub struct Opt {
     pub value: String,
     pub label: String,
     pub data: Option<Value>,
+    pub row: Option<Value>,
+    pub msg: Option<Value>,
 }
 
 impl Opt {
@@ -137,10 +217,24 @@ impl Opt {
             value: value.into(),
             label: label.into(),
             data: None,
+            row: None,
+            msg: None,
         }
+    }
+    /// An option with a fixed label: the message's text, with its id.
+    pub fn fixed(value: impl Into<String>, id: &str, params: Value) -> Self {
+        let m = crate::view::msg(id, params);
+        let mut o = Opt::new(value, m["text"].as_str().unwrap_or_default());
+        o.msg = Some(m);
+        o
     }
     pub fn data(mut self, d: Value) -> Self {
         self.data = Some(d);
+        self
+    }
+    /// `{"cells": …, "badges"?, "tone"?, "detail"?}`.
+    pub fn row(mut self, r: Value) -> Self {
+        self.row = Some(r);
         self
     }
 }
@@ -151,6 +245,15 @@ fn options_json(opts: &[Opt]) -> Value {
             .enumerate()
             .map(|(i, o)| {
                 let mut v = json!({ "index": i, "value": o.value, "label": strip_ansi(&o.label) });
+                if let Some(m) = &o.msg {
+                    v["msg"] = m["msg"].clone();
+                    if let Some(p) = m.get("params") {
+                        v["params"] = p.clone();
+                    }
+                }
+                if let Some(r) = &o.row {
+                    v["view"] = r.clone();
+                }
                 if let Some(d) = &o.data {
                     v["data"] = d.clone();
                 }
@@ -161,7 +264,17 @@ fn options_json(opts: &[Opt]) -> Value {
 }
 
 /// Emit a prompt and read answers until one is valid. `None` = the answer was `null` (skip).
-fn ask<T>(kind: &str, mut fields: Value, parse: impl Fn(&Value) -> Result<T>) -> Result<Option<T>> {
+fn ask<T>(kind: &str, fields: Value, parse: impl Fn(&Value) -> Result<T>) -> Result<Option<T>> {
+    ask_or(kind, fields, None, parse)
+}
+
+/// [`ask`], where a `null` answer means `null_is` (checked like any answer) when given.
+fn ask_or<T>(
+    kind: &str,
+    mut fields: Value,
+    null_is: Option<Value>,
+    parse: impl Fn(&Value) -> Result<T>,
+) -> Result<Option<T>> {
     let id = format!("p{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
     fields["id"] = json!(id);
     fields["kind"] = json!(kind);
@@ -194,9 +307,11 @@ fn ask<T>(kind: &str, mut fields: Value, parse: impl Fn(&Value) -> Result<T>) ->
             }
             _ => v,
         };
-        if answer.is_null() {
-            return Ok(None);
-        }
+        let answer = match (&answer, &null_is) {
+            (Value::Null, Some(d)) => d.clone(),
+            (Value::Null, None) => return Ok(None),
+            _ => answer,
+        };
         match parse(&answer) {
             Ok(t) => return Ok(Some(t)),
             Err(e) => emit("error", json!({ "id": id, "message": e.to_string() })),
@@ -226,13 +341,15 @@ fn find(opts: &[Opt], a: &Value) -> Result<usize> {
 }
 
 /// Pick one. `None` when skipped (Esc, or `null` in JSON mode).
-pub fn select(msg: &str, opts: &[Opt], page_size: Option<usize>) -> Result<Option<usize>> {
+pub fn select(q: Q, opts: &[Opt], page_size: Option<usize>) -> Result<Option<usize>> {
     if json() {
-        let f = json!({ "message": msg, "options": options_json(opts) });
+        let mut f = q.fields();
+        f["options"] = options_json(opts);
         return ask("select", f, |a| find(opts, a));
     }
     let labels: Vec<String> = opts.iter().map(|o| o.label.clone()).collect();
-    let mut s = inquire::Select::new(msg, labels);
+    let msg = q.text();
+    let mut s = inquire::Select::new(&msg, labels);
     if let Some(n) = page_size {
         s = s.with_page_size(n);
     }
@@ -240,13 +357,15 @@ pub fn select(msg: &str, opts: &[Opt], page_size: Option<usize>) -> Result<Optio
 }
 
 /// Pick one; skipping counts as cancelling.
-pub fn select_one(msg: &str, opts: &[Opt]) -> Result<usize> {
-    select(msg, opts, None)?.ok_or_else(|| Cancelled.into())
+pub fn select_one(q: Q, opts: &[Opt]) -> Result<usize> {
+    select(q, opts, None)?.ok_or_else(|| Cancelled.into())
 }
 
-pub fn multi_select(msg: &str, opts: &[Opt], defaults: &[usize]) -> Result<Vec<usize>> {
+pub fn multi_select(q: Q, opts: &[Opt], defaults: &[usize]) -> Result<Vec<usize>> {
     if json() {
-        let f = json!({ "message": msg, "options": options_json(opts), "default": defaults });
+        let mut f = q.fields();
+        f["options"] = options_json(opts);
+        f["default"] = json!(defaults);
         let picked = ask("multiselect", f, |a| match a {
             Value::Array(items) => items.iter().map(|x| find(opts, x)).collect(),
             Value::String(s) if s == "all" => Ok((0..opts.len()).collect()),
@@ -261,7 +380,7 @@ pub fn multi_select(msg: &str, opts: &[Opt], defaults: &[usize]) -> Result<Vec<u
         return Ok(picked.unwrap_or_default());
     }
     let labels: Vec<String> = opts.iter().map(|o| o.label.clone()).collect();
-    Ok(inquire::MultiSelect::new(msg, labels)
+    Ok(inquire::MultiSelect::new(&q.text(), labels)
         .with_default(defaults)
         .raw_prompt()?
         .into_iter()
@@ -269,9 +388,10 @@ pub fn multi_select(msg: &str, opts: &[Opt], defaults: &[usize]) -> Result<Vec<u
         .collect())
 }
 
-pub fn confirm(msg: &str, default: bool) -> Result<bool> {
+pub fn confirm(q: Q, default: bool) -> Result<bool> {
     if json() {
-        let f = json!({ "message": msg, "default": default });
+        let mut f = q.fields();
+        f["default"] = json!(default);
         let a = ask("confirm", f, |a| match a {
             Value::Bool(b) => Ok(*b),
             Value::String(s) => match s.to_ascii_lowercase().as_str() {
@@ -283,19 +403,34 @@ pub fn confirm(msg: &str, default: bool) -> Result<bool> {
         })?;
         return Ok(a.unwrap_or(default));
     }
-    Ok(inquire::Confirm::new(msg).with_default(default).prompt()?)
+    Ok(inquire::Confirm::new(&q.text())
+        .with_default(default)
+        .prompt()?)
 }
 
-/// A terminal text question with an answer check: `check` says what's wrong (or `None`); a
-/// bad answer is explained and asked again. Not for JSON mode, where kex asks no free text
-/// that needs checking.
-pub fn text_checked(
-    msg: &str,
-    default: &str,
-    check: impl Fn(&str) -> Option<String>,
-) -> Result<String> {
+/// A text question with an answer check: `check` says what's wrong (or `None`). In the
+/// terminal a bad answer is explained and asked again; in JSON mode it is an `error` with the
+/// prompt's id, and the prompt stays open.
+pub fn text_checked(q: Q, default: &str, check: impl Fn(&str) -> Option<String>) -> Result<String> {
+    if json() {
+        let mut f = q.fields();
+        f["default"] = json!(default);
+        let a = ask_or("text", f, Some(json!(default)), |a| {
+            let s = match a {
+                Value::String(s) => s.trim().to_string(),
+                Value::Number(n) => n.to_string(),
+                _ => bail!("expected a string"),
+            };
+            match check(&s) {
+                None => Ok(s),
+                Some(problem) => bail!("{problem}"),
+            }
+        })?;
+        return Ok(a.unwrap_or_default());
+    }
+    let msg = q.text();
     loop {
-        let s = inquire::Text::new(msg)
+        let s = inquire::Text::new(&msg)
             .with_default(default)
             .prompt()?
             .trim()
@@ -307,9 +442,10 @@ pub fn text_checked(
     }
 }
 
-pub fn text(msg: &str, default: Option<&str>) -> Result<String> {
+pub fn text(q: Q, default: Option<&str>) -> Result<String> {
     if json() {
-        let f = json!({ "message": msg, "default": default });
+        let mut f = q.fields();
+        f["default"] = json!(default);
         let a = ask("text", f, |a| match a {
             Value::String(s) => Ok(s.clone()),
             Value::Number(n) => Ok(n.to_string()),
@@ -317,7 +453,8 @@ pub fn text(msg: &str, default: Option<&str>) -> Result<String> {
         })?;
         return Ok(a.or(default.map(String::from)).unwrap_or_default());
     }
-    let mut t = inquire::Text::new(msg);
+    let msg = q.text();
+    let mut t = inquire::Text::new(&msg);
     if let Some(d) = default {
         t = t.with_default(d);
     }

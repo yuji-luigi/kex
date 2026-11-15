@@ -20,13 +20,14 @@ pub fn state() -> State {
     if util::which("gh").is_none() {
         return State::Missing;
     }
-    let ok = Command::new("gh")
-        .args(["auth", "status"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let ok = crate::cancel::status(
+        Command::new("gh")
+            .args(["auth", "status"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .is_ok_and(|s| s.success());
     if ok { State::Ready } else { State::LoggedOut }
 }
 
@@ -52,13 +53,13 @@ pub fn help(state: State) -> String {
 
 /// Run gh in `dir` and return its stdout.
 pub fn gh(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("gh")
-        .args(args)
-        .current_dir(dir)
-        .env("GH_PAGER", "cat")
-        .stdin(Stdio::null())
-        .output()
-        .context("failed to run gh")?;
+    let out = crate::cancel::output(
+        Command::new("gh")
+            .args(args)
+            .current_dir(dir)
+            .env("GH_PAGER", "cat"),
+    )
+    .context("failed to run gh")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("Could not resolve") || err.contains("HTTP 404") {
@@ -81,11 +82,7 @@ pub fn gh_inherit(dir: &Path, args: &[&str], no_pager: bool) -> Result<bool> {
     }
     if crate::ui::json() {
         // Keep stdout for events: capture, then send the text as log lines.
-        let out = c
-            .env("NO_COLOR", "1")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .context("failed to run gh")?;
+        let out = crate::cancel::output(c.env("NO_COLOR", "1")).context("failed to run gh")?;
         let text = String::from_utf8_lossy(&out.stdout);
         if !text.trim().is_empty() {
             crate::ui::say(text.trim_end());
@@ -96,7 +93,9 @@ pub fn gh_inherit(dir: &Path, args: &[&str], no_pager: bool) -> Result<bool> {
         }
         return Ok(out.status.success());
     }
-    Ok(c.status().context("failed to run gh")?.success())
+    Ok(crate::cancel::status(&mut c)
+        .context("failed to run gh")?
+        .success())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

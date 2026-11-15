@@ -99,6 +99,7 @@ with `kex init --from -`; see [docs/gui-integration.md](docs/gui-integration.md)
 | `kex browse [dir]` | folders as a tree with their repos, and workspace files (`--json` for programs; `--repos-only`, `--no-git`) |
 | `kex init --reset` | new ids for a config copied from another repo |
 | `kex update` | install the latest release (`--check` only reports) |
+| `kex manifest` | every command, option and exit code, for programs (`--json`: a [cli-events/1](spec/cli-events-1.md) manifest) |
 | `kex completions zsh` | shell completions (bash, zsh, fish, powershell) |
 
 kex never commits, force-pushes, rebases or merges on its own. Protected branches always
@@ -144,13 +145,19 @@ Exit codes: 0 ok, 1 some repo failed, 2 error, 3 missing tool, 130 cancelled.
 
 Full reference with TypeScript types for every message: [docs/json-protocol.md](docs/json-protocol.md).
 
+kex speaks [cli-events/1](spec/cli-events-1.md), a small tool-neutral standard (MIT): `kex
+manifest --json` describes every command and option, and every result carries a generic
+`view` (card, table, tree, service, log), so a client can drive kex with no kex-specific
+code. `hello.features` has `"cli_events"` when it does; details in
+[docs/self-description.md](docs/self-description.md).
+
 Add `--json` to any command and stdout becomes a stream of JSON objects, one per line,
 with nothing else mixed in (output of tools kex starts, like `git push`, goes to stderr).
 Every question turns into a `prompt` event; answer it with one line on stdin.
 
 ```
 $ kex run --json
-{"type":"hello","kex":"0.2.0","protocol":1,"features":["browse","from",…]}
+{"type":"hello","standard":"cli-events/1",…,"kex":"0.2.0","protocol":1,"features":["browse","from",…,"cli_events"]}
 {"type":"project","id":"acme-shop-7f3kq2","repos":[…],"missing":[],"warnings":[]}
 {"type":"prompt","id":"p1","kind":"multiselect","message":"Run which repos?","default":[0,1],
  "options":[{"index":0,"value":"api","label":"api …","data":{"runtime":"node · pnpm run dev","port":3000,…}},
@@ -161,8 +168,10 @@ $ kex run --json
 {"type":"ready","repo":"api","url":"http://localhost:3000"}
 ← {"type":"stop"}
 {"type":"exited","repo":"api","code":0,"success":true}
-{"type":"exit","code":0}
+{"type":"exit","code":0,"tone":"ok"}
 ```
+
+(`key` and `view` on the results are left out above.)
 
 Answers:
 
@@ -184,8 +193,8 @@ into that service; `repo` defaults to the Flutter one, so `r` / `R` / `q` work) 
 `hello` carries `features` (e.g. `"browse"`, `"from"`): check those to know what this kex
 can do, rather than its version. Events: `hello`, `project`, `log` (`level`, `text`: everything a person would see),
 `prompt`, `error`, `pull` (per repo, with `unmerged` branches), `status`, `prs`, `merged`,
-`pushed`, `added`, `tree`, `workspaces`, `plan`, `started`, `output`, `ready`, `exited`, `version`, `update_available`, `updated`,
-and always `exit` (`code`) last.
+`pushed`, `added`, `tree`, `workspaces`, `plan`, `pr`, `manifest`, `started`, `output`, `ready`, `exited`, `version`, `update_available`, `updated`,
+and always `exit` (`code`, `tone`) last.
 
 ## Releases
 

@@ -13,12 +13,12 @@ pub fn doctor() -> Result<u8> {
     p.print_header();
     for r in &p.repos {
         let remote = git::shared_remote(&r.path);
-        say!(
+        crate::ui::say_win(&format!(
             "  {} {:<8} {}",
             util::green("✓"),
             r.name,
             util::tilde(&r.path)
-        );
+        ));
         if let Some(d) = &r.config.description {
             say!("      about     {d}");
         }

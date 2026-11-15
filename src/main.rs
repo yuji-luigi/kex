@@ -1,12 +1,14 @@
 #[macro_use]
 mod ui;
 mod browse;
+mod cancel;
 mod config;
 mod doctor;
 mod flutter;
 mod gh;
 mod git;
 mod init;
+mod manifest;
 mod pr;
 mod project;
 mod pull;
@@ -17,6 +19,7 @@ mod setup;
 mod tree;
 mod update;
 mod util;
+mod view;
 mod workspace;
 
 use std::path::PathBuf;
@@ -158,6 +161,8 @@ enum Cmd {
     Link { path: PathBuf },
     /// Print shell completions
     Completions { shell: clap_complete::Shell },
+    /// Describe kex's commands, options and exit codes for programs (cli-events/1)
+    Manifest,
     /// Install the latest kex release
     Update {
         /// Only report whether a new version exists
@@ -182,22 +187,56 @@ enum PrCmd {
     },
 }
 
+fn hello() {
+    ui::set_json();
+    ui::emit(
+        "hello",
+        serde_json::json!({
+            "standard": manifest::STANDARD,
+            "tool": { "name": "kex", "version": env!("CARGO_PKG_VERSION") },
+            "manifest_version": manifest::MANIFEST_VERSION,
+            "manifest_hash": manifest::hash(),
+            "kex": env!("CARGO_PKG_VERSION"),
+            "protocol": ui::PROTOCOL,
+            "features": ui::FEATURES,
+        }),
+    );
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // A usage error with --json is still a JSON stream: hello, error, exit 2.
+        Err(e)
+            if std::env::args().any(|a| a == "--json")
+                && !matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            hello();
+            let message = e.to_string();
+            let message = message
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("error: ");
+            ui::emit("error", serde_json::json!({ "message": message }));
+            ui::emit(
+                "exit",
+                serde_json::json!({ "code": 2, "tone": manifest::exit_tone(2) }),
+            );
+            return ExitCode::from(2);
+        }
+        Err(e) => e.exit(),
+    };
     if cli.json {
-        ui::set_json();
-        ui::emit(
-            "hello",
-            serde_json::json!({
-                "kex": env!("CARGO_PKG_VERSION"),
-                "protocol": ui::PROTOCOL,
-                "features": ui::FEATURES,
-            }),
-        );
+        hello();
+        cancel::install();
     }
     let notify = !matches!(
         cli.command,
-        Some(Cmd::Update { .. } | Cmd::Completions { .. })
+        Some(Cmd::Update { .. } | Cmd::Completions { .. } | Cmd::Manifest)
     );
     let code = match dispatch(cli.command) {
         Ok(code) => code,
@@ -225,7 +264,10 @@ fn main() -> ExitCode {
     if notify && code != 130 {
         update::notice();
     }
-    ui::event("exit", serde_json::json!({ "code": code }));
+    ui::event(
+        "exit",
+        serde_json::json!({ "code": code, "tone": manifest::exit_tone(code) }),
+    );
     ExitCode::from(code)
 }
 
@@ -299,7 +341,11 @@ fn dispatch(cmd: Option<Cmd>) -> Result<u8> {
         Some(Cmd::Scan { dir }) => doctor::scan(dir),
         Some(Cmd::Link { path }) => doctor::link(&path),
         Some(Cmd::Update { check, yes, quiet }) => update::run(check, quiet, yes),
+        Some(Cmd::Manifest) => manifest::command(),
         Some(Cmd::Completions { shell }) => {
+            if ui::json() {
+                anyhow::bail!("completions write a shell script, not JSON: run it without --json");
+            }
             clap_complete::generate(shell, &mut Cli::command(), "kex", &mut std::io::stdout());
             Ok(0)
         }
@@ -312,26 +358,47 @@ fn menu() -> Result<u8> {
         Cli::command().print_help()?;
         return Ok(0);
     }
-    let gh_note = if gh::state() == gh::State::Ready {
-        ""
-    } else {
-        "  [needs gh]"
+    let gh_ready = gh::state() == gh::State::Ready;
+    let item = |value: &str, words: &str, params: serde_json::Value| {
+        let d = view::msg(&format!("menu.{value}"), params);
+        let needs_gh = value == "pr" && !gh_ready;
+        let label = format!(
+            "{words:<9} {}{}",
+            d["text"].as_str().unwrap_or_default(),
+            if needs_gh { "  [needs gh]" } else { "" }
+        );
+        let description = view::cell(d["text"].clone(), None, Some(d.clone()));
+        let mut row =
+            serde_json::json!({ "cells": { "command": words, "description": description } });
+        if needs_gh {
+            row["badges"] = serde_json::json!([view::badge("needs_gh", "warn")]);
+        }
+        ui::Opt::new(value, label).row(row)
     };
+    let none = serde_json::Value::Null;
     let mut items = vec![
-        ui::Opt::new("pull", "pull      update all repos + show unmerged work"),
-        ui::Opt::new("run", "run       start services"),
-        ui::Opt::new("pr", format!("pr check  review and merge PRs{gh_note}")),
-        ui::Opt::new("status", "status    git status of every repo"),
-        ui::Opt::new("push", "push      push current branch of selected repos"),
-        ui::Opt::new("doctor", "doctor    what kex knows about this project"),
+        item("pull", "pull", none.clone()),
+        item("run", "run", none.clone()),
+        item("pr", "pr check", none.clone()),
+        item("status", "status", none.clone()),
+        item("push", "push", none.clone()),
+        item("doctor", "doctor", none.clone()),
     ];
     if let Some(v) = update::available() {
-        items.push(ui::Opt::new(
+        items.push(item(
             "update",
-            format!("update    install kex {v} (you have {})", update::CURRENT),
+            "update",
+            serde_json::json!({ "version": v, "current": update::CURRENT }),
         ));
     }
-    let choice = ui::select_one("kex", &items)?;
+    let q = ui::Q::new("menu.pick", none).with(
+        "columns",
+        serde_json::json!([
+            view::col("command", "code"),
+            view::col("description", "text")
+        ]),
+    );
+    let choice = ui::select_one(q, &items)?;
     dispatch(Some(match items[choice].value.as_str() {
         "pull" => Cmd::Pull {
             all: false,

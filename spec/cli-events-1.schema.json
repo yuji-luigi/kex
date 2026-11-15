@@ -1,0 +1,1658 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/yuji-luigi/kex/main/spec/cli-events-1.schema.json",
+  "title": "cli-events/1 line",
+  "description": "One NDJSON line of the cli-events/1 standard (spec/cli-events-1.md), in either direction. MIT licence. Unknown fields are allowed everywhere: clients ignore them.",
+  "$ref": "#/$defs/Line",
+  "$defs": {
+    "Line": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "view": {
+          "$ref": "#/$defs/View"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "hello"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/Hello"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "manifest"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/ManifestLine"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "prompt"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/Prompt"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "log"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/Log"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "error"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/Error"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "result"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/Result"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "exit"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/Exit"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "answer"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/Answer"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "not": {
+                  "enum": [
+                    "hello",
+                    "manifest",
+                    "prompt",
+                    "log",
+                    "error",
+                    "result",
+                    "exit",
+                    "answer"
+                  ]
+                }
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/ToolLine"
+          }
+        }
+      ]
+    },
+    "Hello": {
+      "type": "object",
+      "required": [
+        "type",
+        "standard",
+        "tool",
+        "manifest_version",
+        "manifest_hash"
+      ],
+      "properties": {
+        "type": {
+          "const": "hello"
+        },
+        "standard": {
+          "const": "cli-events/1"
+        },
+        "tool": {
+          "$ref": "#/$defs/ToolId"
+        },
+        "manifest_version": {
+          "const": 1
+        },
+        "manifest_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$",
+          "description": "first 16 hex characters of SHA-256 over the RFC 8785 canonical JSON of the manifest (spec section 7.1)"
+        }
+      }
+    },
+    "ToolId": {
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "homepage": {
+          "type": "string"
+        }
+      }
+    },
+    "ManifestLine": {
+      "type": "object",
+      "required": [
+        "type",
+        "manifest"
+      ],
+      "properties": {
+        "type": {
+          "const": "manifest"
+        },
+        "manifest": {
+          "$ref": "#/$defs/Manifest"
+        }
+      }
+    },
+    "Log": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/MsgFields"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "type",
+        "level",
+        "text"
+      ],
+      "properties": {
+        "type": {
+          "const": "log"
+        },
+        "level": {
+          "$ref": "#/$defs/Level"
+        },
+        "restates": {
+          "type": "string",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "Error": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/MsgFields"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "type",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "error"
+        },
+        "message": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "field": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "Result": {
+      "type": "object",
+      "required": [
+        "type",
+        "view"
+      ],
+      "properties": {
+        "type": {
+          "const": "result"
+        },
+        "view": {
+          "$ref": "#/$defs/View"
+        }
+      }
+    },
+    "Exit": {
+      "type": "object",
+      "required": [
+        "type",
+        "code",
+        "tone"
+      ],
+      "properties": {
+        "type": {
+          "const": "exit"
+        },
+        "code": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "tone": {
+          "$ref": "#/$defs/ExitTone"
+        }
+      }
+    },
+    "Answer": {
+      "type": "object",
+      "required": [
+        "type",
+        "id"
+      ],
+      "properties": {
+        "type": {
+          "const": "answer"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "answer": {
+          "$ref": "#/$defs/AnswerValue"
+        },
+        "cancel": {
+          "const": true
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "answer"
+          ]
+        },
+        {
+          "required": [
+            "cancel"
+          ]
+        }
+      ]
+    },
+    "AnswerValue": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          }
+        }
+      ]
+    },
+    "ToolLine": {
+      "type": "object",
+      "required": [
+        "type",
+        "view"
+      ],
+      "properties": {
+        "view": {
+          "$ref": "#/$defs/View"
+        }
+      }
+    },
+    "MsgId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$"
+    },
+    "Params": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "MsgFields": {
+      "description": "msg / params next to the line's main string (log.text, error.message, prompt.message, option.label).",
+      "type": "object",
+      "properties": {
+        "msg": {
+          "$ref": "#/$defs/MsgId"
+        },
+        "params": {
+          "$ref": "#/$defs/Params"
+        }
+      }
+    },
+    "Msg": {
+      "type": "object",
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "msg": {
+          "$ref": "#/$defs/MsgId"
+        },
+        "params": {
+          "$ref": "#/$defs/Params"
+        }
+      }
+    },
+    "Text": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/Msg"
+        }
+      ]
+    },
+    "Tone": {
+      "type": "string",
+      "description": "ok | warn | danger | muted | info; unknown tones are drawn as none"
+    },
+    "Level": {
+      "type": "string",
+      "description": "info | warn | error | win; unknown levels are info"
+    },
+    "ExitTone": {
+      "enum": [
+        "ok",
+        "partial",
+        "error",
+        "missing_tool",
+        "cancelled"
+      ]
+    },
+    "ValueType": {
+      "type": "string",
+      "description": "text | number | count | bool | branch | path | url | date | badge | code; unknown types are text"
+    },
+    "Value": {
+      "oneOf": [
+        {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "Cell": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Value"
+        },
+        {
+          "type": "object",
+          "required": [
+            "value"
+          ],
+          "properties": {
+            "value": {
+              "$ref": "#/$defs/Value"
+            },
+            "text": {
+              "$ref": "#/$defs/Text"
+            },
+            "tone": {
+              "$ref": "#/$defs/Tone"
+            }
+          }
+        }
+      ]
+    },
+    "Cells": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Cell"
+      }
+    },
+    "Badge": {
+      "type": "object",
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "$ref": "#/$defs/Text"
+        },
+        "tone": {
+          "$ref": "#/$defs/Tone"
+        }
+      }
+    },
+    "LogLine": {
+      "type": "object",
+      "required": [
+        "level",
+        "text"
+      ],
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/Level"
+        },
+        "text": {
+          "$ref": "#/$defs/Text"
+        }
+      }
+    },
+    "Field": {
+      "type": "object",
+      "required": [
+        "key",
+        "label",
+        "value"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "$ref": "#/$defs/Text"
+        },
+        "value": {
+          "$ref": "#/$defs/Value"
+        },
+        "type": {
+          "$ref": "#/$defs/ValueType"
+        },
+        "tone": {
+          "$ref": "#/$defs/Tone"
+        }
+      }
+    },
+    "Column": {
+      "type": "object",
+      "required": [
+        "key",
+        "label"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "$ref": "#/$defs/Text"
+        },
+        "type": {
+          "$ref": "#/$defs/ValueType"
+        },
+        "hidden": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Row": {
+      "type": "object",
+      "required": [
+        "key",
+        "cells"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "cells": {
+          "$ref": "#/$defs/Cells"
+        },
+        "badges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Badge"
+          }
+        },
+        "tone": {
+          "$ref": "#/$defs/Tone"
+        },
+        "detail": {
+          "$ref": "#/$defs/Text"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Field"
+          }
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Action"
+          }
+        }
+      }
+    },
+    "Action": {
+      "type": "object",
+      "required": [
+        "label"
+      ],
+      "properties": {
+        "label": {
+          "$ref": "#/$defs/Text"
+        },
+        "tone": {
+          "$ref": "#/$defs/Tone"
+        },
+        "confirm": {
+          "$ref": "#/$defs/Text"
+        },
+        "send": {
+          "type": "object"
+        },
+        "run": {
+          "$ref": "#/$defs/Run"
+        },
+        "effect": {
+          "type": "string",
+          "description": "write | install | delete; an unknown effect needs a confirm"
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "send"
+          ]
+        },
+        {
+          "required": [
+            "run"
+          ]
+        }
+      ]
+    },
+    "Run": {
+      "type": "object",
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "options": {
+          "type": "object"
+        },
+        "stdin": true,
+        "cwd": {
+          "type": "string"
+        }
+      }
+    },
+    "View": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "$ref": "#/$defs/Text"
+        },
+        "subtitle": {
+          "$ref": "#/$defs/Text"
+        },
+        "summary": {
+          "$ref": "#/$defs/Text"
+        },
+        "tone": {
+          "$ref": "#/$defs/Tone"
+        },
+        "badges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Badge"
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LogLine"
+          }
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Action"
+          }
+        },
+        "mode": {
+          "enum": [
+            "replace",
+            "append"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "log"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/LogView"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "card"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/CardView"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "table"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/TableView"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "cards"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/TableView"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "tree"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/TreeView"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "service"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/ServiceView"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "progress"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/ProgressView"
+          }
+        }
+      ]
+    },
+    "Appending": {
+      "description": "true when the view only adds to an earlier one: then its kind's required fields may be missing",
+      "properties": {
+        "mode": {
+          "const": "append"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "LogView": {
+      "if": {
+        "$ref": "#/$defs/Appending"
+      },
+      "else": {
+        "required": [
+          "lines"
+        ]
+      },
+      "properties": {
+        "lines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LogLine"
+          }
+        }
+      }
+    },
+    "CardView": {
+      "properties": {
+        "fields": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Field"
+          }
+        },
+        "sections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/View"
+          }
+        }
+      }
+    },
+    "TableView": {
+      "if": {
+        "$ref": "#/$defs/Appending"
+      },
+      "else": {
+        "required": [
+          "columns",
+          "rows"
+        ]
+      },
+      "properties": {
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Row"
+          }
+        },
+        "empty": {
+          "$ref": "#/$defs/Text"
+        },
+        "title_column": {
+          "type": "string"
+        },
+        "next": {
+          "$ref": "#/$defs/RunAction"
+        }
+      }
+    },
+    "TreeView": {
+      "required": [
+        "nodes"
+      ],
+      "properties": {
+        "root": {
+          "type": "object",
+          "required": [
+            "label"
+          ],
+          "properties": {
+            "label": {
+              "$ref": "#/$defs/Text"
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TreeNode"
+          }
+        },
+        "open": {
+          "type": "object",
+          "required": [
+            "run",
+            "option"
+          ],
+          "properties": {
+            "run": {
+              "$ref": "#/$defs/Run"
+            },
+            "option": {
+              "type": "string"
+            }
+          }
+        },
+        "up": {
+          "$ref": "#/$defs/RunAction"
+        },
+        "next": {
+          "$ref": "#/$defs/RunAction"
+        }
+      }
+    },
+    "TreeNode": {
+      "type": "object",
+      "required": [
+        "key",
+        "label"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "$ref": "#/$defs/Text"
+        },
+        "value": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "cells": {
+          "$ref": "#/$defs/Cells"
+        },
+        "badges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Badge"
+          }
+        },
+        "tone": {
+          "$ref": "#/$defs/Tone"
+        },
+        "detail": {
+          "$ref": "#/$defs/Text"
+        },
+        "selectable": {
+          "type": "boolean"
+        },
+        "item": {
+          "type": "object"
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TreeNode"
+          }
+        },
+        "more": {
+          "type": "boolean"
+        },
+        "checked": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ServiceView": {
+      "if": {
+        "$ref": "#/$defs/Appending"
+      },
+      "else": {
+        "required": [
+          "name",
+          "state"
+        ]
+      },
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Text"
+        },
+        "state": {
+          "type": "string",
+          "description": "starting | running | ready | stopping | exited | failed"
+        },
+        "command": {
+          "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "text"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "stream": {
+                "enum": [
+                  "stdout",
+                  "stderr"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "ProgressView": {
+      "if": {
+        "$ref": "#/$defs/Appending"
+      },
+      "else": {
+        "required": [
+          "current",
+          "total"
+        ]
+      },
+      "properties": {
+        "current": {
+          "type": "number",
+          "minimum": 0
+        },
+        "total": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "label": {
+          "$ref": "#/$defs/Text"
+        }
+      }
+    },
+    "Prompt": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/MsgFields"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "type",
+        "id",
+        "kind",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "prompt"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "tone": {
+          "$ref": "#/$defs/Tone"
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "picks_from": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PromptOption"
+          }
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "min_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expect": {
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "select"
+            }
+          },
+          "required": [
+            "options"
+          ]
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "multiselect"
+            },
+            "default": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "required": [
+            "options",
+            "default"
+          ]
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "confirm"
+            },
+            "default": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "default"
+          ]
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "text"
+            },
+            "default": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "default"
+          ]
+        }
+      ]
+    },
+    "PromptOption": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/MsgFields"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "index",
+        "value",
+        "label"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "view": {
+          "type": "object",
+          "required": [
+            "cells"
+          ],
+          "properties": {
+            "cells": {
+              "$ref": "#/$defs/Cells"
+            },
+            "badges": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Badge"
+              }
+            },
+            "tone": {
+              "$ref": "#/$defs/Tone"
+            },
+            "detail": {
+              "$ref": "#/$defs/Text"
+            }
+          }
+        },
+        "data": {
+          "type": "object"
+        }
+      }
+    },
+    "Manifest": {
+      "type": "object",
+      "required": [
+        "manifest_version",
+        "standard",
+        "tool",
+        "features",
+        "global_options",
+        "commands",
+        "exit_codes",
+        "views",
+        "event_types",
+        "messages"
+      ],
+      "properties": {
+        "manifest_version": {
+          "const": 1
+        },
+        "standard": {
+          "const": "cli-events/1"
+        },
+        "tool": {
+          "$ref": "#/$defs/ToolId"
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "global_options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Option"
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Command"
+          }
+        },
+        "exit_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExitCode"
+          }
+        },
+        "views": {
+          "type": "object",
+          "required": [
+            "kinds",
+            "value_types"
+          ],
+          "properties": {
+            "kinds": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "value_types": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "event_types": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "type",
+              "view_kind",
+              "description"
+            ],
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "view_kind": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "messages": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/MsgId"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "CommandId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$"
+    },
+    "Command": {
+      "type": "object",
+      "required": [
+        "id",
+        "words",
+        "label",
+        "description",
+        "interactive",
+        "long_running",
+        "options"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/CommandId"
+        },
+        "words": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "group": {
+          "type": "string"
+        },
+        "icon": {
+          "type": "string"
+        },
+        "interactive": {
+          "type": "boolean"
+        },
+        "long_running": {
+          "type": "boolean"
+        },
+        "stop": {
+          "type": "object"
+        },
+        "needs_terminal": {
+          "type": "boolean"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Option"
+          }
+        },
+        "json_input": {
+          "$ref": "#/$defs/JsonInput"
+        },
+        "examples": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "options"
+            ],
+            "properties": {
+              "label": {
+                "$ref": "#/$defs/Text"
+              },
+              "options": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "read_only": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Option": {
+      "type": "object",
+      "required": [
+        "id",
+        "type",
+        "label"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "flag": {
+          "type": "string",
+          "pattern": "^--[a-z0-9][a-z0-9-]*$"
+        },
+        "short": {
+          "type": "string",
+          "pattern": "^-[A-Za-z0-9]$"
+        },
+        "positional": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "type": {
+          "type": "string",
+          "description": "boolean | string | integer | choice | list | path | paths | json"
+        },
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "placeholder": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "default": true,
+        "choices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "value",
+              "label"
+            ],
+            "properties": {
+              "value": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "min_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        },
+        "separator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repeatable": {
+          "type": "boolean"
+        },
+        "conflicts_with": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "requires": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "role": {
+          "type": "string",
+          "description": "json | dry_run"
+        },
+        "stdin_value": {
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "flag"
+          ]
+        },
+        {
+          "required": [
+            "positional"
+          ]
+        }
+      ]
+    },
+    "ExitCode": {
+      "type": "object",
+      "required": [
+        "code",
+        "tone"
+      ],
+      "properties": {
+        "code": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "tone": {
+          "$ref": "#/$defs/ExitTone"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "JsonInput": {
+      "type": "object",
+      "required": [
+        "option",
+        "schema"
+      ],
+      "properties": {
+        "option": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "object"
+        },
+        "dry_run": {
+          "type": "string"
+        },
+        "picker": {
+          "type": "object",
+          "required": [
+            "command",
+            "into"
+          ],
+          "properties": {
+            "command": {
+              "$ref": "#/$defs/CommandId"
+            },
+            "options": {
+              "type": "object"
+            },
+            "select_kinds": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "into": {
+              "type": "string",
+              "pattern": "^(/[^/]*)*$"
+            }
+          }
+        }
+      }
+    },
+    "RunAction": {
+      "description": "An action that starts the tool again (navigation slots take only this kind).",
+      "allOf": [
+        {
+          "$ref": "#/$defs/Action"
+        }
+      ],
+      "required": [
+        "run"
+      ]
+    }
+  }
+}

@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 
 use crate::config::{self, Config, Peer, Stage};
 use crate::registry::{GlobalConfig, Registry};
-use crate::{git, util};
+use crate::{git, util, view};
 
 const DAY: u64 = 86_400;
 
@@ -307,14 +307,22 @@ impl Project {
                     util::tilde(&r.path),
                     git::current_branch(&r.path)
                 );
-                crate::ui::Opt::new(r.path.display().to_string(), label)
+                crate::ui::Opt::new(r.path.display().to_string(), label).row(serde_json::json!({
+                    "cells": { "path": r.path, "branch": git::current_branch(&r.path) },
+                }))
             })
             .collect();
-        let i = crate::ui::select_one(
-            &format!("{name} has {} clones. Which one?", cs.len()),
-            &opts,
-        )?;
-        if crate::ui::confirm("Remember this choice?", true)? {
+        let q = crate::ui::Q::new(
+            "clones.pick",
+            serde_json::json!({ "repo": name, "n": cs.len() }),
+        )
+        .with(
+            "columns",
+            serde_json::json!([view::col("path", "path"), view::col("branch", "branch")]),
+        );
+        let i = crate::ui::select_one(q, &opts)?;
+        let remember = crate::ui::Q::new("clones.remember", serde_json::Value::Null);
+        if crate::ui::confirm(remember, true)? {
             reg.preferred.insert(key, cs[i].path.clone());
             reg.save()?;
         }
@@ -322,9 +330,31 @@ impl Project {
     }
 
     pub fn print_header(&self) {
+        let names: Vec<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
+        let mut seen = std::collections::HashSet::new();
+        let names: Vec<&str> = names.into_iter().filter(|n| seen.insert(*n)).collect();
+        let missing: Vec<&str> = self.missing.iter().map(|m| m.repo.as_str()).collect();
+        let mut fields = vec![view::field("repos", serde_json::json!(names), "text")];
+        if !missing.is_empty() {
+            let mut f = view::field("missing", serde_json::json!(missing), "text");
+            f["tone"] = serde_json::json!("warn");
+            fields.push(f);
+        }
+        let notes: Vec<serde_json::Value> = self
+            .warnings
+            .iter()
+            .map(|w| view::note("warn", serde_json::json!(w)))
+            .collect();
         crate::ui::event(
             "project",
             serde_json::json!({
+                "key": "project",
+                "view": view::view("card", serde_json::json!({
+                    "title": view::m("project.title"),
+                    "subtitle": self.id,
+                    "fields": fields,
+                    "notes": notes,
+                })),
                 "id": self.id,
                 "repos": self.repos.iter().map(|r| serde_json::json!({
                     "repo": r.name, "path": r.path, "worktree": r.worktree,
@@ -335,16 +365,20 @@ impl Project {
                 "warnings": self.warnings,
             }),
         );
-        say!("{} {}", util::bold("project"), self.id);
+        let about = |level: &str, text: String| crate::ui::say_about("project", level, &text);
+        about("info", format!("{} {}", util::bold("project"), self.id));
         for w in &self.warnings {
-            warn!("{} {w}", util::yellow("⚠"));
+            crate::ui::warn_about("project", &format!("{} {w}", util::yellow("⚠")));
         }
         for m in &self.missing {
-            say!(
-                "  {} {:<8} not on this machine ({})",
-                util::red("✗"),
-                m.repo,
-                m.remote
+            about(
+                "info",
+                format!(
+                    "  {} {:<8} not on this machine ({})",
+                    util::red("✗"),
+                    m.repo,
+                    m.remote
+                ),
             );
         }
     }

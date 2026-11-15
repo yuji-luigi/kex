@@ -16,10 +16,14 @@ pub struct Sim {
 
 /// Available iOS simulators, booted ones and iPhones first.
 fn list() -> Result<Vec<Sim>> {
-    let out = Command::new("xcrun")
-        .args(["simctl", "list", "devices", "available", "-j"])
-        .output()
-        .context("running xcrun (is Xcode installed?)")?;
+    let out = crate::cancel::output(Command::new("xcrun").args([
+        "simctl",
+        "list",
+        "devices",
+        "available",
+        "-j",
+    ]))
+    .context("running xcrun (is Xcode installed?)")?;
     if !out.status.success() {
         bail!(
             "xcrun simctl failed: {}",
@@ -91,12 +95,25 @@ pub fn choose(name: Option<&str>) -> Result<Sim> {
                 s.runtime,
                 if s.booted { " · booted" } else { "" }
             );
-            crate::ui::Opt::new(&s.udid, label).data(serde_json::json!({
-                "name": s.name, "runtime": s.runtime, "booted": s.booted,
-            }))
+            let mut row = serde_json::json!({ "cells": { "name": s.name, "runtime": s.runtime } });
+            if s.booted {
+                row["badges"] = serde_json::json!([crate::view::badge("booted", "ok")]);
+            }
+            crate::ui::Opt::new(&s.udid, label)
+                .data(serde_json::json!({
+                    "name": s.name, "runtime": s.runtime, "booted": s.booted,
+                }))
+                .row(row)
         })
         .collect();
-    let i = crate::ui::select_one("iOS simulator", &opts)?;
+    let q = crate::ui::Q::new("run.simulator", serde_json::Value::Null).with(
+        "columns",
+        serde_json::json!([
+            crate::view::col("name", "text"),
+            crate::view::col("runtime", "text")
+        ]),
+    );
+    let i = crate::ui::select_one(q, &opts)?;
     Ok(sims.swap_remove(i))
 }
 

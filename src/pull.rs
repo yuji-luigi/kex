@@ -4,12 +4,18 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 
+use serde_json::{Value, json};
+
 use crate::project::{self, Repo};
-use crate::{gh, git, ui, util};
+use crate::{gh, git, ui, util, view};
 
 pub struct Update {
     pub branch: String,
+    /// As the terminal shows it (colored).
     pub status: String,
+    /// The same as a message (`pull.*`), and the tone of the card.
+    pub msg: Value,
+    pub tone: &'static str,
     pub ok: bool,
 }
 
@@ -21,57 +27,151 @@ fn first_line(e: &anyhow::Error) -> String {
 pub fn update(r: &Repo, to_prime: bool) -> Update {
     let dir = &r.path;
     let mut branch = git::current_branch(dir);
-    let fail = |branch: String, msg: String| Update {
-        branch,
-        status: util::red(format!("✗ {msg}")),
-        ok: false,
-    };
-    let done = |branch: String, status: String| Update {
-        branch,
-        status,
-        ok: true,
+    // `tone`: ok / warn / muted / danger; danger = failed (exit code 1).
+    let out = |branch: String, id: &str, params: Value, tone: &'static str| {
+        let msg = view::msg(id, params);
+        let text = msg["text"].as_str().unwrap_or_default().to_string();
+        let status = match tone {
+            "ok" => util::green(text),
+            "warn" => util::yellow(text),
+            "danger" => util::red(text),
+            _ => util::dim(text),
+        };
+        Update {
+            branch,
+            status,
+            msg,
+            tone,
+            ok: tone != "danger",
+        }
     };
 
     if let Err(e) = git::git(dir, &["fetch", "--all", "--prune", "--quiet"]) {
-        return fail(branch, format!("fetch failed: {}", first_line(&e)));
+        let error = first_line(&e);
+        return out(
+            branch,
+            "pull.fetch_failed",
+            json!({ "error": error }),
+            "danger",
+        );
     }
     if git::is_dirty(dir) {
-        return done(branch, util::yellow("⚠ uncommitted changes, pull skipped"));
+        return out(branch, "pull.dirty", Value::Null, "warn");
     }
     if to_prime && let Some(p) = r.prime().filter(|p| *p != branch) {
         if let Err(e) = git::git(dir, &["switch", "--quiet", p]) {
-            return fail(
-                branch,
-                format!("could not switch to {p}: {}", first_line(&e)),
-            );
+            let params = json!({ "branch": p, "error": first_line(&e) });
+            return out(branch, "pull.switch_failed", params, "danger");
         }
         branch = p.to_string();
     }
     if !git::has_upstream(dir) {
-        return done(branch, util::dim("no upstream, pull skipped"));
+        return out(branch, "pull.no_upstream", Value::Null, "muted");
     }
     let behind = git::count(dir, &["HEAD..@{u}"]);
     let ahead = git::count(dir, &["@{u}..HEAD"]);
     if behind == 0 {
-        return done(branch, util::green("✓ up to date"));
+        return out(branch, "pull.up_to_date", Value::Null, "ok");
     }
     if ahead > 0 {
-        return done(
-            branch,
-            util::yellow(format!(
-                "⚠ diverged ({ahead} ahead, {behind} behind), pull skipped"
-            )),
-        );
+        let params = json!({ "ahead": ahead, "behind": behind });
+        return out(branch, "pull.diverged", params, "warn");
     }
     match git::git(dir, &["merge", "--ff-only", "--quiet", "@{u}"]) {
-        Ok(_) => done(
+        Ok(_) => {
+            let id = if behind == 1 {
+                "pull.pulled_one"
+            } else {
+                "pull.pulled"
+            };
+            out(branch, id, json!({ "n": behind }), "ok")
+        }
+        Err(e) => out(
             branch,
-            util::green(format!(
-                "↓ {behind} commit{} pulled",
-                if behind == 1 { "" } else { "s" }
-            )),
+            "pull.failed",
+            json!({ "error": first_line(&e) }),
+            "danger",
         ),
-        Err(e) => fail(branch, format!("pull failed: {}", first_line(&e))),
+    }
+}
+
+/// The key of a repo's pull card.
+pub fn key(r: &Repo) -> String {
+    format!("pull:{}", r.path.display())
+}
+
+/// A `pull` event: the old fields, plus its card. `found`: the unmerged branches (or why
+/// there is no list); `None` when not reported (a second clone, `kex run`).
+pub fn event(r: &Repo, u: &Update, found: Option<&Result<Vec<Branch>, Note>>) -> Value {
+    let mut sections = Vec::new();
+    let mut notes = Vec::new();
+    match found {
+        Some(Ok(bs)) if !bs.is_empty() => {
+            let columns = json!([
+                view::col("branch", "branch"),
+                view::col("ahead", "count"),
+                view::col("behind", "count"),
+                view::col("prime", "branch"),
+                view::col("author", "text"),
+                view::col("last_commit", "date"),
+            ]);
+            let rows: Vec<Value> = bs
+                .iter()
+                .map(|b| {
+                    json!({ "key": b.name, "cells": {
+                        "branch": b.name, "ahead": b.ahead, "behind": b.behind,
+                        "prime": b.prime, "author": b.author, "last_commit": b.iso_date,
+                    }})
+                })
+                .collect();
+            sections.push(view::view(
+                "table",
+                json!({ "title": view::m("pull.unmerged"), "columns": columns, "rows": rows }),
+            ));
+        }
+        Some(Err(n)) => notes.push(view::note("info", n.msg.clone())),
+        _ => {}
+    }
+    let mut v = json!({
+        "repo": r.name, "path": r.path, "branch": u.branch, "ok": u.ok,
+        "status": ui::strip_ansi(&u.status),
+        "key": key(r),
+        "view": view::view("card", json!({
+            "title": r.name,
+            "subtitle": u.branch,
+            "tone": u.tone,
+            "summary": u.msg,
+            "fields": [view::field("path", json!(r.path), "path")],
+            "sections": sections,
+            "notes": notes,
+        })),
+    });
+    if let Some(f) = found {
+        v["unmerged"] = match f {
+            Ok(bs) => json!(bs.iter().map(Branch::json).collect::<Vec<_>>()),
+            Err(_) => Value::Null,
+        };
+        v["unmerged_note"] = match f {
+            Err(n) => json!(n.text()),
+            Ok(_) => Value::Null,
+        };
+    }
+    v
+}
+
+/// Why there is no list of unmerged branches.
+pub struct Note {
+    msg: Value,
+}
+
+impl Note {
+    fn new(id: &str, params: Value) -> Self {
+        Note {
+            msg: view::msg(id, params),
+        }
+    }
+    pub fn text(&self) -> String {
+        self.msg["text"].as_str().unwrap_or_default().to_string()
     }
 }
 
@@ -104,6 +204,8 @@ pub struct Branch {
     pub behind: u32,
     pub author: String,
     pub date: String,
+    /// RFC 3339, for the view.
+    pub iso_date: String,
 }
 
 impl Branch {
@@ -128,10 +230,10 @@ impl Branch {
 
 /// Branches on the shared remote not merged into any prime branch. `Err` = why there is no
 /// list (no remote, no prime branch).
-pub fn unmerged(r: &Repo, all: bool, merged: &HashSet<String>) -> Result<Vec<Branch>, String> {
+pub fn unmerged(r: &Repo, all: bool, merged: &HashSet<String>) -> Result<Vec<Branch>, Note> {
     let dir = &r.path;
     let Some(remote) = git::shared_remote(dir) else {
-        return Err("no remote".into());
+        return Err(Note::new("pull.no_remote", Value::Null));
     };
     let primes: Vec<&str> = r
         .config
@@ -151,9 +253,9 @@ pub fn unmerged(r: &Repo, all: bool, merged: &HashSet<String>) -> Result<Vec<Bra
         })
         .collect();
     if primes.is_empty() {
-        return Err(format!("no prime branch found on {remote}"));
+        return Err(Note::new("pull.no_prime", json!({ "remote": remote })));
     }
-    let format = "--format=%(refname:short)%09%(authorname)%09%(committerdate:unix)%09%(committerdate:format:%Y-%m-%d %H:%M)";
+    let format = "--format=%(refname:short)%09%(authorname)%09%(committerdate:unix)%09%(committerdate:format:%Y-%m-%d %H:%M)%09%(committerdate:iso-strict)";
     let Ok(refs) = git::git(
         dir,
         &["for-each-ref", &format!("refs/remotes/{remote}"), format],
@@ -165,7 +267,7 @@ pub fn unmerged(r: &Repo, all: bool, merged: &HashSet<String>) -> Result<Vec<Bra
     let mut out = Vec::new();
     for line in refs.lines() {
         let f: Vec<&str> = line.split('\t').collect();
-        if f.len() < 4 {
+        if f.len() < 5 {
             continue;
         }
         let (tip, author, date) = (f[0], f[1], f[3]);
@@ -208,6 +310,7 @@ pub fn unmerged(r: &Repo, all: bool, merged: &HashSet<String>) -> Result<Vec<Bra
             behind,
             author: author.to_string(),
             date: date.to_string(),
+            iso_date: f[4].to_string(),
         });
     }
     Ok(out)
@@ -238,38 +341,34 @@ pub fn run(all: bool, to_prime: bool) -> Result<u8> {
     });
     let mut code = 0;
     for ((r, _), (u, found)) in jobs.iter().zip(results) {
-        ui::event(
-            "pull",
-            serde_json::json!({
-                "repo": r.name, "path": r.path, "branch": u.branch, "ok": u.ok,
-                "status": ui::strip_ansi(&u.status),
-                "unmerged": match &found {
-                    Some(Ok(bs)) => serde_json::json!(bs.iter().map(Branch::json).collect::<Vec<_>>()),
-                    _ => serde_json::Value::Null,
-                },
-                "unmerged_note": match &found { Some(Err(n)) => Some(n.as_str()), _ => None },
-            }),
-        );
+        let mut ev = event(r, &u, found.as_ref());
+        if found.is_none() {
+            ev["unmerged"] = Value::Null;
+            ev["unmerged_note"] = Value::Null;
+        }
+        ui::event("pull", ev);
         let lines: Vec<String> = match &found {
             Some(Ok(bs)) => bs.iter().map(Branch::line).collect(),
-            Some(Err(note)) => vec![util::dim(note)],
+            Some(Err(note)) => vec![util::dim(note.text())],
             None => vec![],
         };
+        let key = key(r);
         let path = if p.checkouts(&r.name).len() > 1 {
             format!(" {}", util::dim(util::tilde(&r.path)))
         } else {
             String::new()
         };
-        say!(
+        let line = format!(
             "{} ({}){path} {}",
             util::bold(format!("== {}", r.name)),
             u.branch,
             u.status
         );
+        ui::say_about(&key, "info", &line);
         if !lines.is_empty() {
-            say!("   unmerged:");
+            ui::say_about(&key, "info", "   unmerged:");
             for l in lines {
-                say!("   {l}");
+                ui::say_about(&key, "info", &format!("   {l}"));
             }
         }
         if !u.ok {
@@ -316,9 +415,60 @@ pub fn status() -> Result<u8> {
             })
             .collect();
         let missing: Vec<&str> = p.missing.iter().map(|m| m.repo.as_str()).collect();
+        let rows: Vec<Value> = repos
+            .iter()
+            .zip(&rows)
+            .map(|(r, (branch, up, ahead, behind, changed))| {
+                let (ahead, behind) = if *up {
+                    (
+                        view::count(u64::from(*ahead), "info"),
+                        view::count(u64::from(*behind), "warn"),
+                    )
+                } else {
+                    let none = view::m("status.no_upstream");
+                    (
+                        view::cell(Value::Null, Some("muted"), Some(none)),
+                        Value::Null,
+                    )
+                };
+                let mut row = json!({
+                    "key": r.path,
+                    "cells": {
+                        "repo": r.name, "branch": branch, "ahead": ahead, "behind": behind,
+                        "changed": view::count(*changed as u64, "warn"),
+                    },
+                });
+                if r.worktree {
+                    row["badges"] = json!([view::badge("worktree", "muted")]);
+                }
+                if let Some(d) = &r.config.description {
+                    row["detail"] = json!(d);
+                }
+                row
+            })
+            .collect();
+        let mut notes = Vec::new();
+        if !missing.is_empty() {
+            let m = view::msg("status.missing", json!({ "repos": missing.join(", ") }));
+            notes.push(view::note("warn", m));
+        }
         ui::emit(
             "status",
-            serde_json::json!({ "project": p.id, "repos": list, "missing": missing }),
+            json!({
+                "project": p.id, "repos": list, "missing": missing,
+                "key": "status",
+                "view": view::view("table", json!({
+                    "title": view::m("status.title"),
+                    "subtitle": p.id,
+                    "columns": [
+                        view::col("repo", "text"), view::col("branch", "branch"),
+                        view::col("ahead", "count"), view::col("behind", "count"),
+                        view::col("changed", "count"),
+                    ],
+                    "rows": rows,
+                    "notes": notes,
+                })),
+            }),
         );
         return Ok(0);
     }
